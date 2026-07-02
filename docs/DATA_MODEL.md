@@ -23,7 +23,10 @@ The MVP uses one PostgreSQL instance with service-owned schemas. This gives us r
 
 - `identity.organizations`
 - `identity.plants`
-- `identity.users`
+- `identity.users` (Mapped to Better Auth user entity)
+- `identity.sessions` (Better Auth sessions)
+- `identity.accounts` (Better Auth linked accounts)
+- `identity.verifications` (Better Auth verification tokens)
 - `identity.memberships`
 - `document.documents`
 - `document.document_versions`
@@ -46,3 +49,11 @@ The MVP uses one PostgreSQL instance with service-owned schemas. This gives us r
 - `ai.model_calls`
 
 Database migrations live in `infra/db/migrations`.
+
+### Authentication Schema (Better Auth)
+
+Better Auth handles credentials and session storage using the following tables in the `identity` schema:
+- **`identity.users`**: Extends the default Better Auth `user` schema with tenant fields (e.g. `organization_id`) and profile info.
+- **`identity.sessions`**: Stores active login sessions, tokens, expirations, IP addresses, and user-agents.
+- **`identity.accounts`**: Stores link info for authentication providers (e.g., passwords or OAuth credentials like GitHub or Google).
+- **`identity.verifications`**: Holds temporary tokens and codes for email verification and password resets.

@@ -32,11 +32,47 @@ create table if not exists identity.plants (
 create table if not exists identity.users (
   id uuid primary key default gen_random_uuid(),
   organization_id uuid not null references identity.organizations(id),
-  external_auth_id text,
   name text not null,
   email text not null unique,
+  email_verified boolean not null default false,
+  image text,
   mobile_no text,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists identity.sessions (
+  id text primary key,
+  expires_at timestamptz not null,
+  token text not null unique,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  ip_address text,
+  user_agent text,
+  user_id uuid not null references identity.users(id) on delete cascade
+);
+
+create table if not exists identity.accounts (
+  id text primary key,
+  account_id text not null,
+  provider_id text not null,
+  user_id uuid not null references identity.users(id) on delete cascade,
+  access_token text,
+  refresh_token text,
+  id_token text,
+  expires_at timestamptz,
+  password text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists identity.verifications (
+  id text primary key,
+  identifier text not null,
+  value text not null,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 
 create table if not exists identity.roles (

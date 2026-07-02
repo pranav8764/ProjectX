@@ -5,7 +5,7 @@ Owns organizations, users, roles, memberships, and auth provider mappings.
 ## Responsibilities
 
 - Organization and plant membership lookup
-- User profile mapping from Clerk/BetterAuth/demo auth
+- User profile and session mapping using Better Auth (with local fallback/demo auth)
 - Role-based permission checks
 - Internal permission decision APIs
 
