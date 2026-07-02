@@ -1,0 +1,17 @@
+openapi: 3.1.0
+info:
+  title: Identity Service
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      responses:
+        "200":
+          description: Healthy
+  /internal/permissions/check:
+    post:
+      summary: Check whether a user can perform an action
+      responses:
+        "200":
+          description: Permission decision
+

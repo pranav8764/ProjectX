@@ -1,0 +1,29 @@
+openapi: 3.1.0
+info:
+  title: Report Service
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      responses:
+        "200":
+          description: Healthy
+  /internal/reports:
+    post:
+      summary: Create report job
+      responses:
+        "202":
+          description: Report job accepted
+  /internal/reports/{reportId}:
+    get:
+      summary: Get report job
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Report job
+

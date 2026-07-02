@@ -1,0 +1,23 @@
+openapi: 3.1.0
+info:
+  title: Compliance Service
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      responses:
+        "200":
+          description: Healthy
+  /internal/compliance/gaps:
+    get:
+      summary: List compliance gaps
+      responses:
+        "200":
+          description: Compliance gaps
+  /internal/compliance/check:
+    post:
+      summary: Run compliance check
+      responses:
+        "202":
+          description: Compliance check accepted
+

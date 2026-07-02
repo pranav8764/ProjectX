@@ -1,0 +1,22 @@
+openapi: 3.1.0
+info:
+  title: RCA Service
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      responses:
+        "200":
+          description: Healthy
+  /internal/rca/reports:
+    post:
+      summary: Generate RCA report
+      responses:
+        "202":
+          description: RCA job accepted
+    get:
+      summary: List RCA reports
+      responses:
+        "200":
+          description: RCA reports
+

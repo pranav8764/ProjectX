@@ -1,0 +1,29 @@
+openapi: 3.1.0
+info:
+  title: Graph Service
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      responses:
+        "200":
+          description: Healthy
+  /internal/graph/expand:
+    post:
+      summary: Expand graph context around entities
+      responses:
+        "200":
+          description: Graph context
+  /internal/graph/assets/{assetId}:
+    get:
+      summary: Get graph for an asset
+      parameters:
+        - name: assetId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Asset graph
+

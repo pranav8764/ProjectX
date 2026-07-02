@@ -1,0 +1,23 @@
+openapi: 3.1.0
+info:
+  title: RAG Service
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      responses:
+        "200":
+          description: Healthy
+  /internal/rag/query:
+    post:
+      summary: Run retrieval and generate a cited answer
+      responses:
+        "200":
+          description: Cited answer
+  /internal/rag/search:
+    post:
+      summary: Search relevant chunks without answer generation
+      responses:
+        "200":
+          description: Retrieval results
+

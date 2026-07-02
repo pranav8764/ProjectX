@@ -1,0 +1,254 @@
+x-service-env: &service-env
+  DATABASE_URL: postgresql://plantbrain:plantbrain@postgres:5432/plantbrain
+  REDIS_URL: redis://redis:6379
+  STORAGE_PROVIDER: minio
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY_ID: plantbrain
+  S3_SECRET_ACCESS_KEY: plantbrain123
+  EVENT_BUS: redis-streams
+  LOG_LEVEL: info
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: plantbrain-postgres
+    environment:
+      POSTGRES_DB: plantbrain
+      POSTGRES_USER: plantbrain
+      POSTGRES_PASSWORD: plantbrain
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/db/migrations:/docker-entrypoint-initdb.d
+
+  redis:
+    image: redis:7-alpine
+    container_name: plantbrain-redis
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    container_name: plantbrain-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: plantbrain
+      MINIO_ROOT_PASSWORD: plantbrain123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  api-gateway:
+    profiles: ["services"]
+    build:
+      context: ./services/api-gateway
+    container_name: plantbrain-api-gateway
+    environment:
+      <<: *service-env
+      SERVICE_NAME: api-gateway
+      PORT: 8080
+      IDENTITY_SERVICE_URL: http://identity-service:8081
+      DOCUMENT_SERVICE_URL: http://document-service:8082
+      RAG_SERVICE_URL: http://rag-service:8083
+      ASSET_SERVICE_URL: http://asset-service:8084
+      GRAPH_SERVICE_URL: http://graph-service:8085
+      RCA_SERVICE_URL: http://rca-service:8086
+      COMPLIANCE_SERVICE_URL: http://compliance-service:8087
+      REPORT_SERVICE_URL: http://report-service:8088
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+
+  identity-service:
+    profiles: ["services"]
+    build:
+      context: ./services/identity-service
+    container_name: plantbrain-identity-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: identity-service
+      PORT: 8081
+    ports:
+      - "8081:8081"
+    depends_on:
+      - postgres
+
+  document-service:
+    profiles: ["services"]
+    build:
+      context: ./services/document-service
+    container_name: plantbrain-document-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: document-service
+      PORT: 8082
+    ports:
+      - "8082:8082"
+    depends_on:
+      - postgres
+      - redis
+      - minio
+
+  rag-service:
+    profiles: ["services"]
+    build:
+      context: ./services/rag-service
+    container_name: plantbrain-rag-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: rag-service
+      PORT: 8083
+      AI_ORCHESTRATOR_SERVICE_URL: http://ai-orchestrator-service:8091
+    ports:
+      - "8083:8083"
+    depends_on:
+      - postgres
+      - redis
+
+  asset-service:
+    profiles: ["services"]
+    build:
+      context: ./services/asset-service
+    container_name: plantbrain-asset-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: asset-service
+      PORT: 8084
+    ports:
+      - "8084:8084"
+    depends_on:
+      - postgres
+      - redis
+
+  graph-service:
+    profiles: ["services"]
+    build:
+      context: ./services/graph-service
+    container_name: plantbrain-graph-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: graph-service
+      PORT: 8085
+    ports:
+      - "8085:8085"
+    depends_on:
+      - postgres
+      - redis
+
+  rca-service:
+    profiles: ["services"]
+    build:
+      context: ./services/rca-service
+    container_name: plantbrain-rca-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: rca-service
+      PORT: 8086
+      AI_ORCHESTRATOR_SERVICE_URL: http://ai-orchestrator-service:8091
+    ports:
+      - "8086:8086"
+    depends_on:
+      - postgres
+      - redis
+
+  compliance-service:
+    profiles: ["services"]
+    build:
+      context: ./services/compliance-service
+    container_name: plantbrain-compliance-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: compliance-service
+      PORT: 8087
+      AI_ORCHESTRATOR_SERVICE_URL: http://ai-orchestrator-service:8091
+    ports:
+      - "8087:8087"
+    depends_on:
+      - postgres
+      - redis
+
+  report-service:
+    profiles: ["services"]
+    build:
+      context: ./services/report-service
+    container_name: plantbrain-report-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: report-service
+      PORT: 8088
+    ports:
+      - "8088:8088"
+    depends_on:
+      - postgres
+      - minio
+
+  audit-service:
+    profiles: ["services"]
+    build:
+      context: ./services/audit-service
+    container_name: plantbrain-audit-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: audit-service
+      PORT: 8089
+    ports:
+      - "8089:8089"
+    depends_on:
+      - postgres
+      - redis
+
+  notification-service:
+    profiles: ["services"]
+    build:
+      context: ./services/notification-service
+    container_name: plantbrain-notification-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: notification-service
+      PORT: 8090
+    ports:
+      - "8090:8090"
+    depends_on:
+      - postgres
+      - redis
+
+  ai-orchestrator-service:
+    profiles: ["services"]
+    build:
+      context: ./services/ai-orchestrator-service
+    container_name: plantbrain-ai-orchestrator-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: ai-orchestrator-service
+      PORT: 8091
+    ports:
+      - "8091:8091"
+    depends_on:
+      - postgres
+
+  ingestion-worker:
+    profiles: ["services"]
+    build:
+      context: ./services/ingestion-worker
+    container_name: plantbrain-ingestion-worker
+    environment:
+      <<: *service-env
+      SERVICE_NAME: ingestion-worker
+      PORT: 8092
+      AI_ORCHESTRATOR_SERVICE_URL: http://ai-orchestrator-service:8091
+    ports:
+      - "8092:8092"
+    depends_on:
+      - postgres
+      - redis
+      - minio
+      - ai-orchestrator-service
+
+volumes:
+  postgres-data:
+  minio-data:

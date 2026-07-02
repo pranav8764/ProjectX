@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  placeholder:
+    name: Scaffold CI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate repository scaffold
+        run: |
+          test -f README.md
+          test -f docs/MVP_SCOPE.md
+          test -f docs/MICROSERVICES.md
+          test -f contracts/openapi/api-gateway.yaml
+          test -f contracts/events/asyncapi.yaml
+          test -f infra/db/migrations/001_init.sql
+          test -f services/api-gateway/README.md
+          test -f services/document-service/README.md
+          test -f services/ingestion-worker/README.md
+          test -f services/rag-service/README.md
+      - name: Validate Docker Compose
+        run: docker compose --profile services config

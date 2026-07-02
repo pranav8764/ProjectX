@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://plantbrain.ai/schemas/document-status.schema.json",
+  "title": "DocumentStatus",
+  "type": "string",
+  "enum": [
+    "UPLOADED",
+    "EXTRACTING_TEXT",
+    "OCR_RUNNING",
+    "CLASSIFYING",
+    "CHUNKING",
+    "EXTRACTING_ENTITIES",
+    "GENERATING_EMBEDDINGS",
+    "BUILDING_GRAPH",
+    "INDEXED",
+    "COMPLETED",
+    "PARTIAL_SUCCESS",
+    "FAILED"
+  ]
+}
+

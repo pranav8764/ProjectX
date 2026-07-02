@@ -1,0 +1,128 @@
+asyncapi: 3.0.0
+info:
+  title: PlantBrainAI Events
+  version: 0.1.0
+defaultContentType: application/json
+channels:
+  document.uploaded:
+    address: document.uploaded
+    messages:
+      DocumentUploaded:
+        $ref: "#/components/messages/DocumentUploaded"
+  document.processing_started:
+    address: document.processing_started
+    messages:
+      DocumentProcessingStarted:
+        $ref: "#/components/messages/DocumentProcessingStarted"
+  document.text_extracted:
+    address: document.text_extracted
+    messages:
+      DocumentTextExtracted:
+        $ref: "#/components/messages/DocumentTextExtracted"
+  document.entities_extracted:
+    address: document.entities_extracted
+    messages:
+      DocumentEntitiesExtracted:
+        $ref: "#/components/messages/DocumentEntitiesExtracted"
+  document.indexed:
+    address: document.indexed
+    messages:
+      DocumentIndexed:
+        $ref: "#/components/messages/DocumentIndexed"
+  document.processing_failed:
+    address: document.processing_failed
+    messages:
+      DocumentProcessingFailed:
+        $ref: "#/components/messages/DocumentProcessingFailed"
+  asset.upserted:
+    address: asset.upserted
+    messages:
+      AssetUpserted:
+        $ref: "#/components/messages/AssetUpserted"
+  compliance.gap_detected:
+    address: compliance.gap_detected
+    messages:
+      ComplianceGapDetected:
+        $ref: "#/components/messages/ComplianceGapDetected"
+  rca.report_generated:
+    address: rca.report_generated
+    messages:
+      RcaReportGenerated:
+        $ref: "#/components/messages/RcaReportGenerated"
+  report.generated:
+    address: report.generated
+    messages:
+      ReportGenerated:
+        $ref: "#/components/messages/ReportGenerated"
+operations:
+  publishDocumentUploaded:
+    action: send
+    channel:
+      $ref: "#/channels/document.uploaded"
+  consumeDocumentUploaded:
+    action: receive
+    channel:
+      $ref: "#/channels/document.uploaded"
+components:
+  messages:
+    DocumentUploaded:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+    DocumentProcessingStarted:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+    DocumentTextExtracted:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+    DocumentEntitiesExtracted:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+    DocumentIndexed:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+    DocumentProcessingFailed:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+    AssetUpserted:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+    ComplianceGapDetected:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+    RcaReportGenerated:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+    ReportGenerated:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
+  schemas:
+    EventEnvelope:
+      type: object
+      required:
+        - eventId
+        - eventType
+        - occurredAt
+        - producer
+        - organizationId
+        - correlationId
+        - payload
+      properties:
+        eventId:
+          type: string
+        eventType:
+          type: string
+        occurredAt:
+          type: string
+          format: date-time
+        producer:
+          type: string
+        organizationId:
+          type: string
+        plantId:
+          type: string
+        correlationId:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+

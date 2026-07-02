@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: plantbrain-config
+  namespace: plantbrain
+data:
+  EVENT_BUS: redis-streams
+  STORAGE_PROVIDER: s3
+  LOG_LEVEL: info
+
