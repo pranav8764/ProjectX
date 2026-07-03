@@ -1,6 +1,8 @@
 # Event Contracts
 
-The canonical async contract lives in `contracts/events/asyncapi.yaml`.
+The planned async contract lives in `contracts/events/asyncapi.yaml`.
+
+The current MVP invokes `services/ai` directly over HTTP from `services/api`. Use these event names when document processing moves to Redis Streams or another queue.
 
 ## Event Naming
 
@@ -23,7 +25,7 @@ Every event should use this envelope:
   "eventId": "evt_123",
   "eventType": "document.uploaded",
   "occurredAt": "2026-07-02T10:00:00Z",
-  "producer": "document-service",
+  "producer": "services/api",
   "organizationId": "org_123",
   "plantId": "plant_123",
   "correlationId": "req_123",
@@ -36,6 +38,5 @@ Every event should use this envelope:
 - Consumers must be idempotent.
 - Events must include `correlationId` for tracing.
 - Events must not include raw document content.
-- Services should store processing state before emitting the next event.
+- Producers should store processing state before emitting the next event.
 - Failed processing should emit an explicit failure event.
-

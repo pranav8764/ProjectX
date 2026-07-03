@@ -7,22 +7,55 @@ on:
       - main
 
 jobs:
-  placeholder:
-    name: Scaffold CI
+  validate:
+    name: Validate ProjectX MVP
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate repository scaffold
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Validate repository layout
         run: |
           test -f README.md
           test -f docs/MVP_SCOPE.md
           test -f docs/MICROSERVICES.md
-          test -f contracts/openapi/api-gateway.yaml
+          test -f contracts/openapi/README.md
+          test -f contracts/openapi/api.yaml
+          test -f contracts/openapi/ai.yaml
           test -f contracts/events/asyncapi.yaml
           test -f infra/db/migrations/001_init.sql
-          test -f services/api-gateway/README.md
-          test -f services/document-service/README.md
-          test -f services/ingestion-worker/README.md
-          test -f services/rag-service/README.md
+          test -f services/api/Dockerfile
+          test -f services/api/cmd/server/main.go
+          test -f services/ai/Dockerfile
+          test -f services/ai/app/main.py
+          test ! -e services/api-gateway
+          test ! -e services/document-service
+          test ! -e services/asset-service
+          test ! -e services/identity-service
+          test ! -e services/rag-service
+          test ! -e services/rca-service
+          test ! -e services/compliance-service
+          test ! -e services/report-service
+          test ! -e services/graph-service
+          test ! -e services/ai-orchestrator-service
+          test ! -e services/ingestion-worker
+          test ! -e services/notification-service
+          test ! -e services/audit-service
       - name: Validate Docker Compose
-        run: docker compose --profile services config
+        run: make compose-config
+      - name: Test API
+        working-directory: services/api
+        run: go test ./...
+      - name: Test AI integration flow
+        run: python3 tests/integration_test.py
+      - name: Build web app
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm run build

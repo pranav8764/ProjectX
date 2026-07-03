@@ -1,7 +1,9 @@
 openapi: 3.1.0
 info:
-  title: RAG Service
+  title: "Legacy planning sketch: RAG Service"
   version: 0.1.0
+  description: Legacy domain-service contract sketch for a possible future split. RAG APIs currently run through services/api and services/ai.
+x-contract-status: legacy-domain-sketch
 paths:
   /health:
     get:
@@ -20,4 +22,3 @@ paths:
       responses:
         "200":
           description: Retrieval results
-

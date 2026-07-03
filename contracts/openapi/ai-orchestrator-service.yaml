@@ -1,7 +1,9 @@
 openapi: 3.1.0
 info:
-  title: AI Orchestrator Service
+  title: "Legacy planning sketch: AI Orchestrator Service"
   version: 0.1.0
+  description: Legacy domain-service contract sketch for a possible future split. AI orchestration currently runs in services/ai.
+x-contract-status: legacy-domain-sketch
 paths:
   /health:
     get:
@@ -20,4 +22,3 @@ paths:
       responses:
         "200":
           description: Embeddings
-

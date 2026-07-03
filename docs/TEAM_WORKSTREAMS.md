@@ -17,11 +17,7 @@ Owns:
 
 ## Backend API
 
-Folders:
-
-- `services/api-gateway`
-- `services/identity-service`
-- `services/document-service`
+Folder: `services/api`
 
 Owns:
 
@@ -34,11 +30,7 @@ Owns:
 
 ## Retrieval and AI
 
-Folders:
-
-- `services/ingestion-worker`
-- `services/ai-orchestrator-service`
-- `services/rag-service`
+Folder: `services/ai`
 
 Owns:
 
@@ -55,8 +47,8 @@ Owns:
 
 Folders:
 
-- `services/asset-service`
-- `services/graph-service`
+- `services/api`
+- `services/ai`
 
 Owns:
 
@@ -71,8 +63,8 @@ Owns:
 
 Folders:
 
-- `services/rca-service`
-- `services/compliance-service`
+- `services/api`
+- `services/ai`
 
 Owns:
 
@@ -84,11 +76,7 @@ Owns:
 
 ## Reports, Audit, and Notifications
 
-Folders:
-
-- `services/report-service`
-- `services/audit-service`
-- `services/notification-service`
+Folder: `services/api`
 
 Owns:
 
@@ -110,7 +98,7 @@ Owns:
 - Seed data
 - Storage configuration
 - Queue configuration
-- Kubernetes placeholders
+- Future Kubernetes and Helm manifests
 - Observability config
 
 ## Demo and QA

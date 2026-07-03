@@ -1,23 +1,23 @@
 # Data Model
 
-The MVP uses one PostgreSQL instance with service-owned schemas. This gives us real microservice boundaries while staying easy to run locally.
+The MVP uses one PostgreSQL instance with domain schemas. Runtime is consolidated into `services/api` and `services/ai`, but schema boundaries remain explicit so the project can split services later.
 
 ## Schemas
 
 | Schema | Owner |
 | --- | --- |
-| `identity` | `identity-service` |
-| `document` | `document-service` |
-| `ingestion` | `ingestion-worker` |
-| `asset` | `asset-service` |
-| `graph` | `graph-service` |
-| `rag` | `rag-service` |
-| `rca` | `rca-service` |
-| `compliance` | `compliance-service` |
-| `report` | `report-service` |
-| `audit` | `audit-service` |
-| `notification` | `notification-service` |
-| `ai` | `ai-orchestrator-service` |
+| `identity` | `services/api` |
+| `document` | `services/api` |
+| `ingestion` | `services/ai` |
+| `asset` | `services/api` |
+| `graph` | `services/ai` |
+| `rag` | `services/api`, `services/ai` |
+| `rca` | `services/api`, `services/ai` |
+| `compliance` | `services/api`, `services/ai` |
+| `report` | `services/api` |
+| `audit` | future/runtime schema |
+| `notification` | future/runtime schema |
+| `ai` | `services/ai` |
 
 ## Important Tables
 

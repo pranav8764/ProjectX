@@ -1,0 +1,268 @@
+openapi: 3.1.0
+info:
+  title: PlantBrainAI Consolidated AI Service
+  version: 0.1.0
+  description: Internal Python FastAPI service implemented by services/ai for ingestion, retrieval, RCA, and compliance scans.
+servers:
+  - url: http://localhost:8000
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: AI service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /process-document:
+    post:
+      summary: Start document processing
+      description: Queues background ingestion for a file already saved to the shared uploads volume.
+      tags: [Ingestion]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DocumentProcessRequest"
+      responses:
+        "200":
+          description: Processing task accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentProcessAccepted"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+  /query:
+    post:
+      summary: Run hybrid retrieval and answer generation
+      tags: [RAG]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CopilotQueryRequest"
+      responses:
+        "200":
+          description: Cited answer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CopilotQueryResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+  /rca:
+    post:
+      summary: Generate root cause analysis for an asset
+      tags: [RCA]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RcaGenerateRequest"
+      responses:
+        "200":
+          description: RCA result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RcaResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+  /compliance:
+    get:
+      summary: Scan compliance evidence for a plant
+      tags: [Compliance]
+      parameters:
+        - name: plantId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Compliance gaps created or found during scan
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ComplianceScanGap"
+        "500":
+          $ref: "#/components/responses/Error"
+components:
+  responses:
+    Error:
+      description: Runtime error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ValidationError:
+      description: Request validation error
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, service]
+      properties:
+        status:
+          type: string
+          example: healthy
+        service:
+          type: string
+          example: ai-service
+    ErrorResponse:
+      type: object
+      properties:
+        detail:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+    DocumentProcessRequest:
+      type: object
+      required: [document_id, file_path, file_type, metadata]
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        file_path:
+          type: string
+          description: Path inside the shared uploads volume.
+        file_type:
+          type: string
+          description: File extension without leading dot.
+        metadata:
+          type: object
+          required: [plantId, documentType, title, organizationId]
+          additionalProperties: true
+          properties:
+            plantId:
+              type: string
+              format: uuid
+            documentType:
+              type: string
+            title:
+              type: string
+            organizationId:
+              type: string
+              format: uuid
+    DocumentProcessAccepted:
+      type: object
+      required: [message, document_id]
+      properties:
+        message:
+          type: string
+          example: Document processing started
+        document_id:
+          type: string
+          format: uuid
+    CopilotQueryRequest:
+      type: object
+      required: [question, plantId]
+      properties:
+        question:
+          type: string
+        plantId:
+          type: string
+          format: uuid
+        filters:
+          type: object
+          additionalProperties: true
+          properties:
+            assetTag:
+              type: string
+    CopilotQueryResponse:
+      type: object
+      required: [answer, confidence, citations, relatedAssets, missingInfo]
+      properties:
+        answer:
+          type: string
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Citation"
+        relatedAssets:
+          type: array
+          items:
+            type: string
+        missingInfo:
+          type: array
+          items:
+            type: string
+    Citation:
+      type: object
+      properties:
+        documentId:
+          type: string
+        documentTitle:
+          type: string
+        page:
+          type: integer
+        snippet:
+          type: string
+    RcaGenerateRequest:
+      type: object
+      required: [assetTag, failureDescription]
+      properties:
+        assetTag:
+          type: string
+        failureDescription:
+          type: string
+    RcaResponse:
+      type: object
+      required: [summary, probableCauses, recommendations, confidence, citations]
+      properties:
+        summary:
+          type: string
+        probableCauses:
+          type: array
+          items:
+            type: string
+        recommendations:
+          type: array
+          items:
+            type: string
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        citations:
+          type: array
+          items:
+            type: object
+            properties:
+              documentTitle:
+                type: string
+    ComplianceScanGap:
+      type: object
+      properties:
+        assetTag:
+          type: string
+        gapType:
+          type: string
+        description:
+          type: string
+        severity:
+          type: string
+        status:
+          type: string
+        standard:
+          type: string

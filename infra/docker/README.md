@@ -1,6 +1,6 @@
 # Docker
 
-Root `docker-compose.yml` is the main local development entry point.
+The root `docker-compose.yml` is the main local development entry point.
 
 ## Modes
 
@@ -10,10 +10,23 @@ Start shared infrastructure only:
 make infra-up
 ```
 
-Start infrastructure and placeholder microservice containers:
+This starts PostgreSQL, Redis, and MinIO.
+
+Start the full backend stack:
 
 ```bash
 make services-up
 ```
 
-Each service owns its own `Dockerfile` under `services/<service-name>/Dockerfile`.
+This starts PostgreSQL, Redis, MinIO, `services/api`, and `services/ai`.
+
+Validate compose configuration:
+
+```bash
+make compose-config
+```
+
+Only the two runnable backend services own Dockerfiles:
+
+- `services/api/Dockerfile`
+- `services/ai/Dockerfile`

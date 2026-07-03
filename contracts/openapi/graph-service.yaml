@@ -1,7 +1,9 @@
 openapi: 3.1.0
 info:
-  title: Graph Service
+  title: "Legacy planning sketch: Graph Service"
   version: 0.1.0
+  description: Legacy domain-service contract sketch for a possible future split. Graph writes currently run in services/ai.
+x-contract-status: legacy-domain-sketch
 paths:
   /health:
     get:
@@ -26,4 +28,3 @@ paths:
       responses:
         "200":
           description: Asset graph
-

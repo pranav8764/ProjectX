@@ -10,19 +10,8 @@ ProjectX/
     proto/
     schemas/
   services/
-    api-gateway/
-    identity-service/
-    document-service/
-    ingestion-worker/
-    ai-orchestrator-service/
-    rag-service/
-    asset-service/
-    graph-service/
-    rca-service/
-    compliance-service/
-    report-service/
-    audit-service/
-    notification-service/
+    api/
+    ai/
   packages/
     shared/
   infra/
@@ -40,4 +29,4 @@ ProjectX/
 
 ## Rule of Thumb
 
-If a feature changes business behavior, it belongs in a service. If it changes a request, response, or event shape, it belongs in `contracts`. If it changes deployment/runtime behavior, it belongs in `infra`.
+If a feature changes business behavior, it belongs in `services/api` or `services/ai` depending on whether it is request/domain orchestration or AI/document processing. If it changes a request, response, or event shape, it belongs in `contracts`. If it changes deployment/runtime behavior, it belongs in `infra`.

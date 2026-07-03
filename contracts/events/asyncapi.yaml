@@ -54,6 +54,11 @@ channels:
     messages:
       ReportGenerated:
         $ref: "#/components/messages/ReportGenerated"
+  audit.event_recorded:
+    address: audit.event_recorded
+    messages:
+      AuditEventRecorded:
+        $ref: "#/components/messages/AuditEventRecorded"
 operations:
   publishDocumentUploaded:
     action: send
@@ -95,6 +100,9 @@ components:
     ReportGenerated:
       payload:
         $ref: "#/components/schemas/EventEnvelope"
+    AuditEventRecorded:
+      payload:
+        $ref: "#/components/schemas/EventEnvelope"
   schemas:
     EventEnvelope:
       type: object
@@ -125,4 +133,3 @@ components:
         payload:
           type: object
           additionalProperties: true
-

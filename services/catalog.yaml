@@ -1,66 +1,33 @@
 services:
-  - name: api-gateway
+  - name: api
+    folder: services/api
     port: 8080
     type: http
     public: true
-    owns_schema: null
-  - name: identity-service
-    port: 8081
+    contract: contracts/openapi/api.yaml
+    owns_schema:
+      - identity
+      - document
+      - asset
+      - compliance
+      - report
+      - rag
+      - rca
+  - name: ai
+    folder: services/ai
+    port: 8000
     type: http
     public: false
-    owns_schema: identity
-  - name: document-service
-    port: 8082
-    type: http
-    public: false
-    owns_schema: document
-  - name: rag-service
-    port: 8083
-    type: http
-    public: false
-    owns_schema: rag
-  - name: asset-service
-    port: 8084
-    type: http
-    public: false
-    owns_schema: asset
-  - name: graph-service
-    port: 8085
-    type: http
-    public: false
-    owns_schema: graph
-  - name: rca-service
-    port: 8086
-    type: http
-    public: false
-    owns_schema: rca
-  - name: compliance-service
-    port: 8087
-    type: http
-    public: false
-    owns_schema: compliance
-  - name: report-service
-    port: 8088
-    type: http-worker
-    public: false
-    owns_schema: report
-  - name: audit-service
-    port: 8089
-    type: http-consumer
-    public: false
-    owns_schema: audit
-  - name: notification-service
-    port: 8090
-    type: consumer
-    public: false
-    owns_schema: notification
-  - name: ai-orchestrator-service
-    port: 8091
-    type: http
-    public: false
-    owns_schema: ai
-  - name: ingestion-worker
-    port: 8092
-    type: worker
-    public: false
-    owns_schema: ingestion
+    contract: contracts/openapi/ai.yaml
+    owns_schema:
+      - ingestion
+      - graph
+      - rag
+      - rca
+      - compliance
+      - ai
+legacy_contracts:
+  location:
+    - contracts/openapi/
+  status: planning_sketch_only
+  note: Older domain-level OpenAPI sketches describe possible future splits and are not runnable service folders in the MVP.

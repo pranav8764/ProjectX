@@ -1,0 +1,754 @@
+openapi: 3.1.0
+info:
+  title: PlantBrainAI Consolidated API
+  version: 0.1.0
+  description: Public Go API/BFF implemented by services/api for the consolidated MVP runtime.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      security: []
+      summary: Health check
+      responses:
+        "200":
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /api/me:
+    get:
+      summary: Get authenticated user context
+      tags: [Auth]
+      responses:
+        "200":
+          description: Current user context
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CurrentUser"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/documents:
+    get:
+      summary: List documents
+      tags: [Documents]
+      parameters:
+        - $ref: "#/components/parameters/PlantIdQuery"
+      responses:
+        "200":
+          description: Document list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DocumentSummary"
+  /api/documents/{id}:
+    get:
+      summary: Get document detail
+      tags: [Documents]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Document detail
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      summary: Archive a document
+      tags: [Documents]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Document archived
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/documents/{id}/status:
+    get:
+      summary: Get document processing status
+      tags: [Documents]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Document status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentStatusResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/documents/{id}/download:
+    get:
+      summary: Create a short-lived signed URL for the original document file
+      tags: [Documents]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Signed download link
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentDownloadResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/documents/upload:
+    post:
+      summary: Upload a document and trigger AI processing
+      tags: [Documents]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [plantId, documentType, file]
+              properties:
+                plantId:
+                  type: string
+                  format: uuid
+                documentType:
+                  type: string
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Upload accepted or duplicate detected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentUploadResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /api/copilot/query:
+    post:
+      summary: Ask the RAG copilot
+      tags: [Copilot]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CopilotQueryRequest"
+      responses:
+        "200":
+          description: Cited answer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CopilotQueryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /api/dashboard/metrics:
+    get:
+      summary: Get dashboard metrics
+      tags: [Dashboard]
+      parameters:
+        - $ref: "#/components/parameters/PlantIdQuery"
+      responses:
+        "200":
+          description: Dashboard metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/assets:
+    get:
+      summary: List assets
+      tags: [Assets]
+      parameters:
+        - $ref: "#/components/parameters/PlantIdQuery"
+      responses:
+        "200":
+          description: Asset list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Asset"
+  /api/assets/{id}:
+    get:
+      summary: Get asset profile by id or asset tag
+      tags: [Assets]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Asset profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetProfile"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/rca/generate:
+    post:
+      summary: Generate RCA for an asset
+      tags: [RCA]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RcaGenerateRequest"
+      responses:
+        "200":
+          description: RCA result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RcaResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/compliance/gaps:
+    get:
+      summary: List compliance gaps
+      tags: [Compliance]
+      parameters:
+        - $ref: "#/components/parameters/PlantIdQuery"
+      responses:
+        "200":
+          description: Compliance gaps
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ComplianceGap"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/compliance/scan:
+    post:
+      summary: Run a compliance scan for a plant
+      tags: [Compliance]
+      parameters:
+        - name: plantId
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: Required unless the authenticated session is scoped to a plant.
+      responses:
+        "200":
+          description: Compliance scan result
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/graph:
+    get:
+      summary: Get graph entities and relationships
+      tags: [Graph]
+      parameters:
+        - $ref: "#/components/parameters/PlantIdQuery"
+      responses:
+        "200":
+          description: Graph payload
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  edges:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+  /api/reports:
+    get:
+      summary: List report jobs
+      tags: [Reports]
+      responses:
+        "200":
+          description: Report jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ReportJob"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      summary: Create a CSV, PDF, or DOCX report job
+      tags: [Reports]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportJobRequest"
+      responses:
+        "201":
+          description: Report generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportJobCreated"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/reports/{id}/download:
+    get:
+      summary: Download a completed report
+      tags: [Reports]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Generated report file
+          content:
+            text/csv:
+              schema:
+                type: string
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema:
+                type: string
+                format: binary
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque session token
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    PlantIdQuery:
+      name: plantId
+      in: query
+      required: false
+      schema:
+        type: string
+        format: uuid
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Missing, invalid, or expired session
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: Authenticated user does not have one of the required roles
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, service]
+      properties:
+        status:
+          type: string
+          example: healthy
+        service:
+          type: string
+          example: api
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    MessageResponse:
+      type: object
+      properties:
+        message:
+          type: string
+    CurrentUser:
+      type: object
+      required: [userId, orgId, plantId, role]
+      properties:
+        userId:
+          type: string
+        orgId:
+          type: string
+        plantId:
+          type: string
+        role:
+          type: string
+    DocumentSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        fileType:
+          type: string
+        documentType:
+          type: string
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        ocrConfidence:
+          type: number
+        classificationConfidence:
+          type: number
+        createdAt:
+          type: string
+          format: date-time
+    DocumentStatus:
+      type: string
+      enum:
+        - UPLOADED
+        - EXTRACTING_TEXT
+        - OCR_RUNNING
+        - CONVERTING_TO_MARKDOWN
+        - DETECTING_TABLES
+        - CLASSIFYING
+        - CHUNKING
+        - EXTRACTING_ENTITIES
+        - GENERATING_EMBEDDINGS
+        - BUILDING_GRAPH
+        - STORING_RESULTS
+        - INDEXED
+        - COMPLETED
+        - PARTIAL_SUCCESS
+        - FAILED
+        - ARCHIVED
+    DocumentStatusResponse:
+      type: object
+      properties:
+        documentId:
+          type: string
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        message:
+          type: string
+    DocumentUploadResponse:
+      type: object
+      required: [documentId, status, message]
+      properties:
+        documentId:
+          type: string
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        duplicate:
+          type: boolean
+        message:
+          type: string
+    DocumentDownloadResponse:
+      type: object
+      required: [documentId, downloadUrl, expiresAt, expiresInSec]
+      properties:
+        documentId:
+          type: string
+        downloadUrl:
+          type: string
+          format: uri
+        expiresAt:
+          type: string
+          format: date-time
+        expiresInSec:
+          type: integer
+    CopilotQueryRequest:
+      type: object
+      required: [question]
+      properties:
+        question:
+          type: string
+        plantId:
+          type: string
+          format: uuid
+        filters:
+          type: object
+          additionalProperties: true
+          properties:
+            assetTag:
+              type: string
+            documentTypes:
+              type: array
+              items:
+                type: string
+    CopilotQueryResponse:
+      type: object
+      required: [answer, confidence, citations]
+      properties:
+        answer:
+          type: string
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Citation"
+        relatedAssets:
+          type: array
+          items:
+            type: string
+        missingInfo:
+          type: array
+          items:
+            type: string
+    Citation:
+      type: object
+      properties:
+        documentId:
+          type: string
+        documentTitle:
+          type: string
+        page:
+          type: integer
+        snippet:
+          type: string
+    Asset:
+      type: object
+      properties:
+        id:
+          type: string
+        organizationId:
+          type: string
+        plantId:
+          type: string
+        assetTag:
+          type: string
+        assetName:
+          type: string
+        assetType:
+          type: string
+        location:
+          type: string
+        criticality:
+          type: string
+        riskScore:
+          type: number
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    AssetProfile:
+      allOf:
+        - $ref: "#/components/schemas/Asset"
+        - type: object
+          properties:
+            failures:
+              type: array
+              items:
+                $ref: "#/components/schemas/RcaRecord"
+            documents:
+              type: array
+              items:
+                $ref: "#/components/schemas/LinkedDocument"
+            complianceGaps:
+              type: array
+              items:
+                $ref: "#/components/schemas/ComplianceGap"
+    LinkedDocument:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        documentType:
+          type: string
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        createdAt:
+          type: string
+          format: date-time
+    RcaGenerateRequest:
+      type: object
+      required: [assetTag, failureDescription]
+      properties:
+        assetTag:
+          type: string
+        failureDescription:
+          type: string
+        plantId:
+          type: string
+          format: uuid
+    RcaResponse:
+      type: object
+      properties:
+        summary:
+          type: string
+        probableCauses:
+          type: array
+          items:
+            type: string
+        recommendations:
+          type: array
+          items:
+            type: string
+        confidence:
+          type: number
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Citation"
+    RcaRecord:
+      type: object
+      properties:
+        id:
+          type: string
+        failureSummary:
+          type: string
+        timeline:
+          type: array
+          items:
+            type: string
+        probableCauses:
+          type: array
+          items:
+            type: string
+        recommendations:
+          type: array
+          items:
+            type: string
+        confidence:
+          type: number
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+    ComplianceGap:
+      type: object
+      properties:
+        id:
+          type: string
+        organizationId:
+          type: string
+        plantId:
+          type: string
+        assetId:
+          type: string
+        assetTag:
+          type: string
+        requirementId:
+          type: string
+        gapType:
+          type: string
+        description:
+          type: string
+        severity:
+          type: string
+        evidenceDocumentId:
+          type: string
+        status:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    ReportJobRequest:
+      type: object
+      required: [reportType]
+      properties:
+        plantId:
+          type: string
+          format: uuid
+        reportType:
+          type: string
+          enum:
+            - asset_summary
+            - compliance_gap
+            - document_inventory
+            - rca_report
+            - query_answers
+        format:
+          type: string
+          default: csv
+          enum:
+            - csv
+            - pdf
+            - docx
+        parameters:
+          type: object
+          additionalProperties: true
+    ReportJob:
+      type: object
+      properties:
+        id:
+          type: string
+        reportType:
+          type: string
+        format:
+          type: string
+        status:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+        downloadUrl:
+          type: string
+        errorMessage:
+          type: string
+    ReportJobCreated:
+      allOf:
+        - $ref: "#/components/schemas/ReportJob"
+        - type: object
+          properties:
+            message:
+              type: string

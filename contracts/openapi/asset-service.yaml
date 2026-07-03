@@ -1,7 +1,9 @@
 openapi: 3.1.0
 info:
-  title: Asset Service
+  title: "Legacy planning sketch: Asset Service"
   version: 0.1.0
+  description: Legacy domain-service contract sketch for a possible future split. Asset APIs currently run in services/api.
+x-contract-status: legacy-domain-sketch
 paths:
   /health:
     get:
@@ -26,4 +28,3 @@ paths:
       responses:
         "200":
           description: Asset profile
-

@@ -1,96 +1,32 @@
 # Service Catalog
 
-## API Gateway
+## API
 
-- Folder: `services/api-gateway`
-- Type: HTTP service
+- Folder: `services/api`
+- Type: Go HTTP service
 - Public: yes
-- Depends on: all user-facing services
-- Contracts: `contracts/openapi/api-gateway.yaml`
+- Port: 8080
+- Owns: authentication enforcement, document upload, document registry, asset profiles, compliance gaps, report jobs, frontend BFF routes
+- Uses schemas: `identity`, `document`, `asset`, `compliance`, `report`, `rag`, `rca`
+- Calls: `services/ai`
+- Contract: `contracts/openapi/api.yaml`
+- Implementation reference: consolidated API routes are implemented in `services/api/cmd/server/main.go`.
 
-## Identity Service
+## AI
 
-- Folder: `services/identity-service`
-- Type: HTTP service
+- Folder: `services/ai`
+- Type: Python FastAPI service
 - Public: internal
-- Owns: organizations, users, roles, memberships
-- Contracts: `contracts/openapi/identity-service.yaml`
+- Port: 8000
+- Owns: OCR/text extraction, table extraction, markdown normalization, chunking, entity extraction, embedding generation, vector search, cited RAG answers, RCA generation, compliance scans
+- Uses schemas: `ingestion`, `graph`, `rag`, `rca`, `compliance`, `ai`
+- Contract: `contracts/openapi/ai.yaml`
+- Implementation reference: implemented FastAPI routes live in `services/ai/app/main.py`.
 
-## Document Service
+## Supporting Runtime
 
-- Folder: `services/document-service`
-- Type: HTTP service + event producer
-- Owns: document metadata, upload sessions, versions, status
-- Emits: `document.uploaded`, `document.deleted`, `document.version_created`
-
-## Ingestion Worker
-
-- Folder: `services/ingestion-worker`
-- Type: worker + health endpoint
-- Owns: extraction jobs, chunks, embeddings
-- Consumes: `document.uploaded`
-- Emits: `document.text_extracted`, `document.entities_extracted`, `document.indexed`, `document.processing_failed`
-
-## RAG Service
-
-- Folder: `services/rag-service`
-- Type: HTTP service
-- Owns: queries, citations, feedback
-- Depends on: graph, asset, document, ai-orchestrator
-
-## Asset Service
-
-- Folder: `services/asset-service`
-- Type: HTTP service + event consumer
-- Owns: asset profiles, aliases, risk summaries
-- Consumes: `document.entities_extracted`
-
-## Graph Service
-
-- Folder: `services/graph-service`
-- Type: HTTP service + event consumer
-- Owns: graph entities and relationships
-- Consumes: `document.entities_extracted`
-
-## RCA Service
-
-- Folder: `services/rca-service`
-- Type: HTTP service
-- Owns: RCA workflows and reports
-- Depends on: rag, asset, graph, ai-orchestrator
-
-## Compliance Service
-
-- Folder: `services/compliance-service`
-- Type: HTTP service + event consumer
-- Owns: requirements, evidence, gaps
-- Consumes: `document.indexed`, `asset.upserted`
-
-## Report Service
-
-- Folder: `services/report-service`
-- Type: HTTP service + worker
-- Owns: report jobs and generated artifacts
-- Depends on: object storage
-
-## Audit Service
-
-- Folder: `services/audit-service`
-- Type: event consumer + HTTP service
-- Owns: immutable audit events
-- Consumes: all audit-worthy domain events
-
-## Notification Service
-
-- Folder: `services/notification-service`
-- Type: event consumer
-- Owns: alerts and delivery state
-- Consumes: processing failures, compliance gaps, report completion
-
-## AI Orchestrator Service
-
-- Folder: `services/ai-orchestrator-service`
-- Type: internal HTTP service
-- Owns: LLM prompts, model provider selection, safety wrappers
-- Used by: rag, rca, compliance, ingestion
-
+- PostgreSQL + pgvector stores domain schemas and embeddings.
+- Redis is available for future queues/events.
+- MinIO stores original uploads.
+- A shared Docker volume mounted at `/app/uploads` lets `services/api` save files and `services/ai` process them during the MVP.
+- Legacy OpenAPI sketches under `contracts/openapi/*-service.yaml` document possible future domain splits only; they are not deployable service definitions.

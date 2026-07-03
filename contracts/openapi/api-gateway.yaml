@@ -1,7 +1,9 @@
 openapi: 3.1.0
 info:
-  title: PlantBrainAI API Gateway
+  title: "Legacy planning sketch: API Gateway"
   version: 0.1.0
+  description: Legacy domain-service contract sketch for a possible future split. The consolidated MVP public API is contracts/openapi/api.yaml.
+x-contract-status: legacy-domain-sketch
 servers:
   - url: http://localhost:8080
 paths:
@@ -134,4 +136,3 @@ components:
           type: integer
         snippet:
           type: string
-

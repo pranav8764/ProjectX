@@ -110,9 +110,11 @@ create table if not exists document.document_versions (
   file_url text not null,
   file_type text not null,
   file_sha256 text,
+  markdown_content text,
   ocr_confidence numeric,
   classification_confidence numeric,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 
 alter table document.documents
@@ -163,7 +165,7 @@ create table if not exists ingestion.document_chunks (
   page_no integer,
   chunk_index integer not null,
   chunk_text text not null,
-  embedding vector(768),
+  embedding vector(1536),
   token_count integer,
   metadata_json jsonb not null default '{}',
   created_at timestamptz not null default now()

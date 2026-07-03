@@ -1,23 +1,14 @@
 # Services
 
-PlantBrainAI backend is split into bounded microservices. External clients should call only `api-gateway`; domain services are internal.
+PlantBrainAI currently uses a consolidated MVP backend. External clients call the Go API/BFF, and long-running AI/document intelligence work is handled by the Python AI service.
 
 ## Service List
 
 | Service | Purpose |
 | --- | --- |
-| `api-gateway` | Public API gateway and frontend BFF |
-| `identity-service` | Organizations, users, roles, memberships |
-| `document-service` | Document metadata, uploads, versions, status |
-| `ingestion-worker` | OCR, parsing, chunking, embeddings |
-| `ai-orchestrator-service` | LLM calls, prompts, model routing, safety helpers |
-| `rag-service` | Hybrid retrieval, cited answers, query history |
-| `asset-service` | Asset profiles, aliases, risk summaries |
-| `graph-service` | Entities, relationships, knowledge graph expansion |
-| `rca-service` | Root cause analysis workflows and reports |
-| `compliance-service` | Requirements, evidence, compliance gaps |
-| `report-service` | PDF, DOCX, CSV export jobs |
-| `audit-service` | Immutable audit events and access logs |
-| `notification-service` | Alerts and async notifications |
+| `api` | Public API/BFF, dev auth, document upload, asset profiles, compliance gaps, report jobs |
+| `ai` | OCR/text extraction, table extraction, chunking, entity extraction, embeddings, RAG answers, RCA, compliance scan |
 
-See `docs/SERVICE_CATALOG.md` for ownership details.
+Do not add empty folders for individual domains. Document, asset, graph, RAG, RCA, compliance, report, audit, and notification are logical modules inside the consolidated runtime until the MVP needs a real service split.
+
+See `docs/SERVICE_CATALOG.md` for ownership details and `contracts/openapi/README.md` for current versus legacy contracts.

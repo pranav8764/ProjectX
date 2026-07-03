@@ -18,19 +18,8 @@ ProjectX/
     schemas/                      Shared JSON schemas
     proto/                        Future gRPC/protobuf contracts
   services/
-    api-gateway/                  Public API gateway and BFF
-    identity-service/             Auth, users, orgs, roles
-    document-service/             Document metadata, upload lifecycle
-    ingestion-worker/             Parsing, OCR, chunking, embeddings
-    ai-orchestrator-service/      LLM provider, prompts, safety policies
-    rag-service/                  Retrieval, citations, copilot answers
-    asset-service/                Assets, tags, profiles, timelines
-    graph-service/                Knowledge graph entities/relations
-    rca-service/                  Root cause analysis workflows
-    compliance-service/           Compliance checks and gaps
-    report-service/               PDF/DOCX/CSV report generation
-    audit-service/                Audit trail and access events
-    notification-service/         Alerts and async user notifications
+    api/                          Go API/BFF: auth, uploads, assets, compliance, reports
+    ai/                           Python AI service: OCR, chunking, embeddings, RAG, RCA
   packages/
     shared/                       Shared types, schemas, constants
   infra/
@@ -38,7 +27,7 @@ ProjectX/
     docker/                       Docker helper files
     k8s/                          Kubernetes manifests
     observability/                Logs, metrics, tracing config
-    terraform/                    Cloud infrastructure placeholders
+    terraform/                    Future cloud infrastructure
   docs/                           Product, architecture, API, and team docs
   data/
     sample-documents/             Demo PDFs, scans, CSVs, and reports
@@ -50,14 +39,9 @@ ProjectX/
 ## Recommended Team Split
 
 - Frontend: `apps/web`
-- API gateway and service contracts: `services/api-gateway`, `contracts`
-- Auth and workspace management: `services/identity-service`
-- Document upload and metadata: `services/document-service`
-- OCR, parsing, extraction, embeddings: `services/ingestion-worker`
-- RAG and AI behavior: `services/rag-service`, `services/ai-orchestrator-service`
-- Asset intelligence and graph: `services/asset-service`, `services/graph-service`
-- RCA and compliance: `services/rca-service`, `services/compliance-service`
-- Reports, audit, notifications: `services/report-service`, `services/audit-service`, `services/notification-service`
+- API, auth, uploads, assets, compliance, reports: `services/api`
+- OCR, parsing, extraction, embeddings, RAG, RCA: `services/ai`
+- Service contracts: `contracts`
 - Database, deployment, observability: `infra`
 - Demo data and evaluation: `data`, `tests`, `docs`
 
@@ -82,14 +66,34 @@ Copy the environment template:
 cp .env.example .env
 ```
 
-Then each team can initialize their own stack inside the relevant folder.
+Install the web dependencies once:
 
-Suggested starting points:
+```bash
+npm --prefix apps/web ci
+```
 
-- `apps/web`: Next.js + TypeScript
-- `services/api-gateway`: Go, Node.js, or FastAPI API gateway
-- `services/ingestion-worker`: Python workers for OCR, extraction, embeddings
-- `services/rag-service`: Python/FastAPI or Node service for hybrid retrieval and answer generation
-- `infra/db`: PostgreSQL + pgvector migrations
+Then start the consolidated local stack:
 
-For the complete service map, read `docs/MICROSERVICES.md`.
+```bash
+make services-up
+make db-seed
+npm --prefix apps/web run dev
+```
+
+Primary starting points:
+
+- `apps/web`: Next.js + TypeScript application
+- `services/api`: Go API/BFF
+- `services/ai`: Python FastAPI AI and ingestion service
+- `infra/db`: PostgreSQL + pgvector migrations and demo seeds
+
+Local service URLs:
+
+- Web app: `http://localhost:3000`
+- API/BFF: `http://localhost:8080`
+- AI service: `http://localhost:8000`
+- MinIO console: `http://localhost:9001`
+
+The Go API seeds a local development session token, `dev-token`, when the database is empty and `APP_ENV` is not `production`.
+
+For the complete service map, read `docs/MICROSERVICES.md`. For deployment commands, read `docs/DEPLOYMENT.md`.
