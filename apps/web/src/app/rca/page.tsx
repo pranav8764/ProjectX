@@ -4,7 +4,8 @@ import React, { Suspense, useState, useEffect } from 'react';
 import NavigationShell from '../../components/NavigationShell';
 import { useData } from '../../context/DataContext';
 import { generateRca, RcaReport } from '../../lib/mockData';
-import { apiFetch } from '../../lib/api';
+import { apiFetch, getStoredSession, PlantBrainSession, readApiError } from '../../lib/api';
+import { canRunAction, getDeniedMessage } from '../../lib/permissions';
 import { useSearchParams } from 'next/navigation';
 import { 
   Activity, 
@@ -20,6 +21,29 @@ import {
 } from 'lucide-react';
 import Link from 'next/link';
 
+type ApiRcaResponse = Partial<RcaReport> & {
+  failureSummary?: string;
+};
+
+function normalizeRcaReport(data: ApiRcaResponse, assetTag: string, description: string): RcaReport {
+  const probableCauses = Array.isArray(data.probableCauses) ? data.probableCauses : [];
+  const recommendations = Array.isArray(data.recommendations) ? data.recommendations : [];
+  const summary = data.summary || data.failureSummary || `RCA report generated for ${assetTag}: ${description}`;
+  const fiveWhys = Array.isArray(data.fiveWhys) && data.fiveWhys.length > 0
+    ? data.fiveWhys
+    : probableCauses.slice(0, 5).map((cause, index) => `Why ${index + 1}? - ${cause}`);
+
+  return {
+    summary,
+    fiveWhys,
+    probableCauses,
+    recommendations,
+    confidence: typeof data.confidence === 'number' ? data.confidence : 0,
+    citations: Array.isArray(data.citations) ? data.citations : [],
+    missingData: Array.isArray(data.missingData) ? data.missingData : [],
+  };
+}
+
 function RcaAssistantPageContent() {
   const searchParams = useSearchParams();
   const { assets } = useData();
@@ -29,6 +53,13 @@ function RcaAssistantPageContent() {
   const [description, setDescription] = useState('');
   const [loading, setLoading] = useState(false);
   const [report, setReport] = useState<RcaReport | null>(null);
+  const [session, setSession] = useState<PlantBrainSession | null>(null);
+  const [actionError, setActionError] = useState('');
+  const canGenerateRca = canRunAction(session?.role, 'generate_rca');
+
+  useEffect(() => {
+    setSession(getStoredSession());
+  }, []);
 
   useEffect(() => {
     if (initialTag) {
@@ -46,8 +77,14 @@ function RcaAssistantPageContent() {
     e.preventDefault();
     if (!assetTag || !description) return;
 
+    if (!canGenerateRca) {
+      setActionError(getDeniedMessage(session?.role, 'generate_rca'));
+      return;
+    }
+
     setLoading(true);
     setReport(null);
+    setActionError('');
 
     // Call API / Fallback Mock
     try {
@@ -63,10 +100,16 @@ function RcaAssistantPageContent() {
         body: JSON.stringify(payload)
       });
 
+      if (res.status === 403) {
+        setActionError(await readApiError(res, 'Your role cannot generate RCA reports.'));
+        setLoading(false);
+        return;
+      }
+
       if (!res.ok) throw new Error('RCA service offline');
 
       const data = await res.json();
-      setReport(data);
+      setReport(normalizeRcaReport(data, assetTag, description));
 
     } catch (err) {
       // Fallback
@@ -87,23 +130,23 @@ function RcaAssistantPageContent() {
       `Asset Tag: ${assetTag}`,
       `Event: ${description}`,
       `Generated: ${new Date().toISOString()}`,
-      `Confidence: ${(report.confidence * 100).toFixed(0)}%`,
+      `Confidence: ${((report.confidence || 0) * 100).toFixed(0)}%`,
       '',
       'SUMMARY',
       report.summary,
       '',
       '5-WHYS CHAIN',
-      ...report.fiveWhys.map((why, index) => `${index + 1}. ${why}`),
+      ...(report.fiveWhys || []).map((why, index) => `${index + 1}. ${why}`),
       '',
       'PROBABLE CAUSES',
-      ...report.probableCauses.map((cause, index) => `${index + 1}. ${cause}`),
+      ...(report.probableCauses || []).map((cause, index) => `${index + 1}. ${cause}`),
       '',
       'RECOMMENDATIONS',
-      ...report.recommendations.map((rec, index) => `${index + 1}. ${rec}`),
+      ...(report.recommendations || []).map((rec, index) => `${index + 1}. ${rec}`),
       '',
       'SUPPORTING EVIDENCE',
-      ...(report.citations?.length
-        ? report.citations.map(citation => `- ${citation.documentTitle}${citation.page ? ` p.${citation.page}` : ''}${citation.snippet ? `: ${citation.snippet}` : ''}`)
+      ...((report.citations || []).length
+        ? (report.citations || []).map(citation => `- ${citation.documentTitle}${citation.page ? ` p.${citation.page}` : ''}${citation.snippet ? `: ${citation.snippet}` : ''}`)
         : ['- No citation returned by the RCA service.']),
       '',
       'MISSING DATA',
@@ -130,6 +173,13 @@ function RcaAssistantPageContent() {
             </div>
 
             <form onSubmit={handleSubmit} className="space-y-4">
+              {actionError && (
+                <div className="p-3 bg-cyber-amber/5 border border-cyber-amber/20 text-amber-200 rounded-xl text-xs flex gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-cyber-amber" />
+                  <span>{actionError}</span>
+                </div>
+              )}
+
               <div>
                 <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Target Equipment Tag</label>
                 <select
@@ -159,8 +209,9 @@ function RcaAssistantPageContent() {
 
               <button
                 type="submit"
-                disabled={loading || !assetTag || !description}
-                className="w-full py-3 bg-cyber-amber hover:bg-amber-600 active:bg-amber-700 text-slate-950 font-bold rounded-xl text-xs transition-all hover:shadow-[0_0_15px_rgba(245,158,11,0.2)] disabled:opacity-50"
+                disabled={loading || !assetTag || !description || !canGenerateRca}
+                title={!canGenerateRca ? getDeniedMessage(session?.role, 'generate_rca') : undefined}
+                className="w-full py-3 bg-cyber-amber hover:bg-amber-600 active:bg-amber-700 text-slate-950 font-bold rounded-xl text-xs transition-all hover:shadow-[0_0_15px_rgba(245,158,11,0.2)] disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {loading ? 'Synthesizing RCA...' : 'Synthesize Root Causes'}
               </button>
@@ -200,7 +251,7 @@ function RcaAssistantPageContent() {
                       RCA FOR {assetTag}
                     </span>
                     <span className="text-[10px] bg-cyber-amber/10 text-cyber-amber border border-cyber-amber/20 px-2.5 py-0.5 rounded-full font-mono font-bold">
-                      Confidence: {(report.confidence * 100).toFixed(0)}%
+                      Confidence: {((report.confidence || 0) * 100).toFixed(0)}%
                     </span>
                   </div>
                   <h3 className="text-base font-bold text-white tracking-wide mt-2">Diagnostic Summary</h3>
@@ -224,7 +275,7 @@ function RcaAssistantPageContent() {
               <div>
                 <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4">Interactive 5-Whys Chain</h4>
                 <div className="flex flex-col items-center gap-4">
-                  {report.fiveWhys.map((why, index) => {
+                  {(report.fiveWhys || []).map((why, index) => {
                     const parts = why.split('? - ');
                     const question = parts[0] + '?';
                     const answer = parts[1] || '';
@@ -240,7 +291,7 @@ function RcaAssistantPageContent() {
                             <span className="text-cyber-amber block mt-1 leading-relaxed">{answer}</span>
                           </div>
                         </div>
-                        {index < report.fiveWhys.length - 1 && (
+                        {index < (report.fiveWhys || []).length - 1 && (
                           <ArrowDown className="w-4 h-4 text-slate-700 animate-pulse" />
                         )}
                       </React.Fragment>
@@ -256,7 +307,7 @@ function RcaAssistantPageContent() {
                 <div className="space-y-3">
                   <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Contributing Factors</h4>
                   <div className="space-y-2">
-                    {report.probableCauses.map((cause, idx) => (
+                    {(report.probableCauses || []).map((cause, idx) => (
                       <div key={idx} className="p-3 bg-[#060918]/50 border border-slate-800 rounded-xl text-xs flex items-start gap-2.5 text-slate-300">
                         <AlertTriangle className="w-4 h-4 text-cyber-rose shrink-0 mt-0.5" />
                         <span>{cause}</span>
@@ -269,7 +320,7 @@ function RcaAssistantPageContent() {
                 <div className="space-y-3">
                   <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Corrective Recommendations</h4>
                   <div className="space-y-2">
-                    {report.recommendations.map((rec, idx) => (
+                    {(report.recommendations || []).map((rec, idx) => (
                       <div key={idx} className="p-3 bg-emerald-500/5 border border-emerald-500/10 rounded-xl text-xs flex items-start gap-2.5 text-slate-300">
                         <CheckCircle2 className="w-4 h-4 text-cyber-emerald shrink-0 mt-0.5" />
                         <span>{rec}</span>
@@ -284,7 +335,7 @@ function RcaAssistantPageContent() {
                 <div className="space-y-3">
                   <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Supporting Evidence</h4>
                   {(report.citations || []).length > 0 ? (
-                    report.citations?.map((citation, idx) => (
+                    (report.citations || []).map((citation, idx) => (
                       <div key={idx} className="p-3 bg-[#060918]/50 border border-slate-800 rounded-xl text-xs text-slate-300">
                         <span className="font-bold text-cyber-blue block">{citation.documentTitle}{citation.page ? ` p.${citation.page}` : ''}</span>
                         {citation.snippet && <span className="text-[11px] text-slate-400 mt-1 block">{citation.snippet}</span>}

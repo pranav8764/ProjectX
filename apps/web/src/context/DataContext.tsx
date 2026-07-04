@@ -11,7 +11,7 @@ import {
   INITIAL_COMPLIANCE_GAPS, 
   INITIAL_CERTIFICATES 
 } from '../lib/mockData';
-import { apiFetch, appendPlantQuery, getPlantId, getStoredSession, mergeStoredSession } from '../lib/api';
+import { apiFetch, appendPlantQuery, getPlantId, getStoredSession, mergeStoredSession, readApiError } from '../lib/api';
 import {
   normalizeCriticality,
   normalizeDocumentStatus,
@@ -29,12 +29,26 @@ export interface UploadMetadata {
   assetTag?: string;
 }
 
+interface DocumentProcessingFields {
+  processingJobId?: string | null;
+  processingStatus?: string | null;
+  processingProgress?: number | null;
+  processingAttempts?: number | null;
+  retryAvailable?: boolean | null;
+  retryUrl?: string | null;
+  processingError?: string | null;
+  jobUpdatedAt?: string | null;
+}
+
 interface DataContextType {
   documents: Document[];
   assets: Asset[];
   complianceGaps: ComplianceGap[];
   certificates: Certificate[];
   uploadDocument: (file: File, type: string, metadata?: UploadMetadata) => Promise<void>;
+  uploadDocumentVersion: (documentId: string, file: File, metadata?: Pick<UploadMetadata, 'title' | 'version'>) => Promise<void>;
+  retryDocumentProcessing: (documentId: string) => Promise<void>;
+  refreshDocumentStatus: (documentId: string) => Promise<void>;
   archiveDocument: (documentId: string) => Promise<void>;
   resolveGap: (gapId: string) => void;
   addFailureEvent: (assetTag: string, description: string, severity: 'Low' | 'Medium' | 'High' | 'Critical') => void;
@@ -87,7 +101,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (docsRes.ok) {
         const apiDocs = await docsRes.json();
-        const nextDocs = apiDocs.map((doc: any): Document => ({
+        const nextDocs = apiDocs.map((doc: any): Document & DocumentProcessingFields => ({
           id: doc.id,
           title: doc.title,
           fileType: doc.fileType || 'FILE',
@@ -100,9 +114,29 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
           plantName: doc.plantName,
           department: doc.department,
           version: doc.version,
+          accessLevel: doc.accessLevel,
+          sensitivity: doc.sensitivity,
+          allowedRoles: doc.allowedRoles,
+          sourceRestricted: doc.sourceRestricted,
+          sourceDownloadAllowed: doc.sourceDownloadAllowed,
+          processingJobId: doc.processingJobId,
+          processingStatus: doc.processingStatus,
+          processingProgress: numberOrNull(doc.processingProgress),
+          processingAttempts: numberOrNull(doc.processingAttempts),
+          retryAvailable: doc.retryAvailable,
+          retryUrl: doc.retryUrl,
+          processingError: doc.processingError || doc.errorMessage,
+          jobUpdatedAt: doc.jobUpdatedAt,
         }));
         loadedDocuments = nextDocs;
         setDocuments(nextDocs);
+
+        await Promise.allSettled(
+          nextDocs
+            .filter((doc: Document & DocumentProcessingFields) => doc.id && !doc.id.startsWith('doc_') && (isRetryCandidate(doc) || isActiveProcessingStatus(doc.status)))
+            .slice(0, 12)
+            .map((doc: Document & DocumentProcessingFields) => refreshDocumentStatus(doc.id))
+        );
       }
 
       if (gapsRes.ok) {
@@ -166,6 +200,67 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     localStorage.setItem('plantbrain_certificates', JSON.stringify(certs));
   };
 
+  const uploadDocumentVersion = async (documentId: string, file: File, metadata: Pick<UploadMetadata, 'title' | 'version'> = {}) => {
+    const existing = documents.find(doc => doc.id === documentId);
+    if (!existing) {
+      throw new Error('Document not found.');
+    }
+    if (file.size === 0) {
+      throw new Error('Empty files cannot be ingested.');
+    }
+    if (file.size > 50 * 1024 * 1024) {
+      throw new Error('Maximum supported file size is 50 MB.');
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    if (metadata.title?.trim()) formData.append('title', metadata.title.trim());
+    if (metadata.version?.trim()) formData.append('versionLabel', metadata.version.trim());
+
+    let uploaded: any = null;
+    if (!documentId.startsWith('doc_')) {
+      const res = await apiFetch(`/api/documents/${encodeURIComponent(documentId)}/versions`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) {
+        throw new Error(await readApiError(res, 'Unable to upload document version'));
+      }
+      uploaded = await res.json();
+      if (uploaded.duplicate) {
+        throw new Error(uploaded.message || 'This file already exists as a document version.');
+      }
+    }
+
+    const nextVersion = uploaded?.versionLabel || metadata.version?.trim() || bumpVersionLabel(existing.version || 'v1');
+    const nextTitle = metadata.title?.trim() || existing.title;
+    setDocuments(prevDocs => {
+      const nextDocs = prevDocs.map(doc => (
+        doc.id === documentId
+          ? {
+              ...doc,
+              title: nextTitle,
+              fileType: file.name.split('.').pop()?.toUpperCase() || doc.fileType,
+              size: file.size > 1024 * 1024 ? `${(file.size / (1024 * 1024)).toFixed(1)} MB` : `${(file.size / 1024).toFixed(0)} KB`,
+              version: nextVersion,
+              status: normalizeDocumentStatus(uploaded?.status || 'UPLOADED'),
+              processingStatus: uploaded?.processingStatus || 'QUEUED',
+              processingProgress: numberOrNull(uploaded?.processingProgress) ?? 0,
+              processingAttempts: numberOrNull(uploaded?.processingAttempts),
+              retryAvailable: Boolean(uploaded?.retryUrl),
+              retryUrl: uploaded?.retryUrl,
+              processingError: uploaded?.message && uploaded?.status === 'FAILED' ? uploaded.message : undefined,
+              ocrConfidence: 0,
+              classificationConfidence: 0,
+              createdAt: new Date().toISOString(),
+            }
+          : doc
+      ));
+      saveState(nextDocs, assets, complianceGaps, certificates);
+      return nextDocs;
+    });
+  };
+
   const uploadDocument = async (file: File, type: string, metadata: UploadMetadata = {}) => {
     const name = file.name;
     const sizeBytes = file.size;
@@ -226,7 +321,25 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setDocuments(prevDocs => {
           const nextDocs = prevDocs.map(d => (
             d.id === newDocId
-              ? { ...d, id: activeDocId, status: normalizeDocumentStatus(uploaded.status || d.status) }
+              ? {
+                  ...d,
+                  id: activeDocId,
+                  status: normalizeDocumentStatus(uploaded.status || d.status),
+                  processingStatus: uploaded.processingStatus || 'QUEUED',
+                  processingProgress: numberOrNull(uploaded.processingProgress) ?? 0,
+                  processingAttempts: numberOrNull(uploaded.processingAttempts),
+                  retryAvailable: Boolean(uploaded.retryUrl),
+                  retryUrl: uploaded.retryUrl,
+                }
+              : d.id === activeDocId
+                ? {
+                    ...d,
+                    processingStatus: uploaded.processingStatus || 'QUEUED',
+                    processingProgress: numberOrNull(uploaded.processingProgress) ?? 0,
+                    processingAttempts: numberOrNull(uploaded.processingAttempts),
+                    retryAvailable: Boolean(uploaded.retryUrl),
+                    retryUrl: uploaded.retryUrl,
+                  }
               : d
           ));
           saveState(nextDocs, assets, complianceGaps, certificates);
@@ -241,15 +354,11 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const statuses: Array<Document['status']> = [
       'EXTRACTING_TEXT',
       'OCR_RUNNING',
-      'CONVERTING_TO_MARKDOWN',
-      'STORING_PAGES',
-      'DETECTING_TABLES',
       'CLASSIFYING',
       'CHUNKING',
       'EXTRACTING_ENTITIES',
       'GENERATING_EMBEDDINGS',
       'BUILDING_GRAPH',
-      'STORING_RESULTS',
       'COMPLETED'
     ];
 
@@ -305,6 +414,93 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }, 1200);
   };
 
+  const refreshDocumentStatus = async (documentId: string) => {
+    if (documentId.startsWith('doc_')) return;
+
+    const res = await apiFetch(`/api/documents/${encodeURIComponent(documentId)}/status`);
+    if (!res.ok) {
+      throw new Error(await readApiError(res, 'Unable to refresh document status'));
+    }
+
+    const status = await res.json();
+    setDocuments(prevDocs => {
+      const nextDocs = prevDocs.map(doc => (
+        doc.id === documentId
+          ? {
+              ...doc,
+              status: normalizeDocumentStatus(status.status || doc.status),
+              processingJobId: status.processingJobId,
+              processingStatus: status.processingStatus,
+              processingProgress: numberOrNull(status.processingProgress),
+              processingAttempts: numberOrNull(status.processingAttempts),
+              retryAvailable: status.retryAvailable,
+              retryUrl: status.retryUrl,
+              processingError: status.errorMessage || status.processingError,
+              jobUpdatedAt: status.jobUpdatedAt || status.updatedAt,
+            }
+          : doc
+      ));
+      saveState(nextDocs, assets, complianceGaps, certificates);
+      return nextDocs;
+    });
+  };
+
+  const retryDocumentProcessing = async (documentId: string) => {
+    const existing = documents.find(doc => doc.id === documentId);
+    if (!existing) {
+      throw new Error('Document not found.');
+    }
+
+    if (documentId.startsWith('doc_')) {
+      setDocuments(prevDocs => {
+        const nextDocs = prevDocs.map(doc => (
+          doc.id === documentId
+            ? {
+                ...doc,
+                status: 'UPLOADED' as Document['status'],
+                processingStatus: 'QUEUED',
+                processingProgress: 0,
+                processingAttempts: (numberOrNull((doc as Document & DocumentProcessingFields).processingAttempts) || 0) + 1,
+                retryAvailable: false,
+                processingError: undefined,
+              }
+            : doc
+        ));
+        saveState(nextDocs, assets, complianceGaps, certificates);
+        return nextDocs;
+      });
+      return;
+    }
+
+    const res = await apiFetch(`/api/documents/${encodeURIComponent(documentId)}/retry-processing`, {
+      method: 'POST',
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(body.error || body.message || await readApiError(res, 'Unable to retry processing'));
+    }
+
+    setDocuments(prevDocs => {
+      const nextDocs = prevDocs.map(doc => (
+        doc.id === documentId
+          ? {
+              ...doc,
+              status: normalizeDocumentStatus(body.status === 'QUEUED' ? 'UPLOADED' : body.status || doc.status),
+              processingStatus: body.status || 'QUEUED',
+              processingProgress: numberOrNull(body.processingProgress) ?? 0,
+              processingAttempts: numberOrNull(body.processingAttempts) ?? ((numberOrNull((doc as Document & DocumentProcessingFields).processingAttempts) || 0) + 1),
+              retryAvailable: Boolean(body.retryUrl),
+              retryUrl: body.retryUrl,
+              processingError: body.status === 'FAILED' ? body.message : undefined,
+              jobUpdatedAt: new Date().toISOString(),
+            }
+          : doc
+      ));
+      saveState(nextDocs, assets, complianceGaps, certificates);
+      return nextDocs;
+    });
+  };
+
   const archiveDocument = async (documentId: string) => {
     const isLocalDemoDocument = documentId.startsWith('doc_');
 
@@ -314,8 +510,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
 
       if (!res.ok && !isLocalDemoDocument) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || 'Unable to archive document');
+        throw new Error(await readApiError(res, 'Unable to archive document'));
       }
     } catch (error) {
       if (!isLocalDemoDocument) {
@@ -381,6 +576,9 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       complianceGaps, 
       certificates, 
       uploadDocument, 
+      uploadDocumentVersion,
+      retryDocumentProcessing,
+      refreshDocumentStatus,
       archiveDocument,
       resolveGap,
       addFailureEvent
@@ -398,6 +596,26 @@ function safelyHydrate<T>(raw: string | null, setter: React.Dispatch<React.SetSt
   } catch {
     // Keep seeded demo data if a previous localStorage value was corrupted.
   }
+}
+
+function bumpVersionLabel(version: string) {
+  const match = /^v(\d+)$/i.exec(version.trim());
+  if (!match) return 'v2';
+  return `v${Number(match[1]) + 1}`;
+}
+
+function numberOrNull(value: unknown) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function isActiveProcessingStatus(status: Document['status']) {
+  return !['COMPLETED', 'FAILED', 'PARTIAL_SUCCESS'].includes(status);
+}
+
+function isRetryCandidate(document: Document & DocumentProcessingFields) {
+  return Boolean(document.retryAvailable || document.retryUrl || document.status === 'FAILED' || document.processingStatus === 'FAILED');
 }
 
 export const useData = () => {

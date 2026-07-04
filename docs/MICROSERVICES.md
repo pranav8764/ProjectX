@@ -41,7 +41,7 @@ The old per-domain names are logical modules in this MVP, not service folders. K
 
 Use one monorepo, one local PostgreSQL instance with separate schemas, Redis, MinIO, the Go API, and the Python AI service.
 
-Canonical runtime contracts live in `contracts/openapi/api.yaml` and `contracts/openapi/ai.yaml`. Older `*-service.yaml` OpenAPI files are legacy planning sketches for possible future splits.
+Canonical runtime contracts live in `contracts/openapi/api.yaml` and `contracts/openapi/ai.yaml`. Do not add split-service OpenAPI files unless the same change introduces a real deployable service.
 
 ## Production Direction
 

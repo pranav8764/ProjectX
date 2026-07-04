@@ -7,6 +7,14 @@ const nextConfig = {
         source: '/api/:path*',
         destination: 'http://localhost:8080/api/:path*',
       },
+      {
+        source: '/api-health',
+        destination: 'http://localhost:8080/health',
+      },
+      {
+        source: '/ai-health',
+        destination: 'http://localhost:8000/health',
+      },
     ];
   },
 };

@@ -29,33 +29,20 @@ jobs:
           test -f contracts/openapi/api.yaml
           test -f contracts/openapi/ai.yaml
           test -f contracts/events/asyncapi.yaml
+
           test -f infra/db/migrations/001_init.sql
           test -f services/api/Dockerfile
           test -f services/api/cmd/server/main.go
           test -f services/ai/Dockerfile
           test -f services/ai/app/main.py
-          test ! -e services/api-gateway
-          test ! -e services/document-service
-          test ! -e services/asset-service
-          test ! -e services/identity-service
-          test ! -e services/rag-service
-          test ! -e services/rca-service
-          test ! -e services/compliance-service
-          test ! -e services/report-service
-          test ! -e services/graph-service
-          test ! -e services/ai-orchestrator-service
-          test ! -e services/ingestion-worker
-          test ! -e services/notification-service
-          test ! -e services/audit-service
+          test -x scripts/smoke.sh
+          sh -n scripts/smoke.sh
+
       - name: Validate Docker Compose
         run: make compose-config
       - name: Test API
-        working-directory: services/api
-        run: go test ./...
+        run: make test-api
       - name: Test AI integration flow
-        run: python3 tests/integration_test.py
+        run: make test-ai
       - name: Build web app
-        working-directory: apps/web
-        run: |
-          npm ci
-          npm run build
+        run: make test-web

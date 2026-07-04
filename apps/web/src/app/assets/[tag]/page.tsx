@@ -3,8 +3,9 @@
 import React, { useEffect, useState } from 'react';
 import NavigationShell from '../../../components/NavigationShell';
 import { useData } from '../../../context/DataContext';
-import { apiFetch } from '../../../lib/api';
+import { apiFetch, getStoredSession, PlantBrainSession } from '../../../lib/api';
 import { Asset, ComplianceGap, Document, FailureEvent } from '../../../lib/mockData';
+import { canRunAction, getDeniedMessage } from '../../../lib/permissions';
 import { 
   Wrench, 
   AlertTriangle, 
@@ -29,6 +30,11 @@ export default function AssetProfilePage({ params }: { params: { tag: string } }
   const [remoteGaps, setRemoteGaps] = useState<ComplianceGap[]>([]);
   const [remoteFailures, setRemoteFailures] = useState<FailureEvent[]>([]);
   const [remoteChecked, setRemoteChecked] = useState(false);
+  const [session, setSession] = useState<PlantBrainSession | null>(null);
+
+  useEffect(() => {
+    setSession(getStoredSession());
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -113,6 +119,9 @@ export default function AssetProfilePage({ params }: { params: { tag: string } }
   const [showLogForm, setShowLogForm] = useState(false);
   const [description, setDescription] = useState('');
   const [severity, setSeverity] = useState<'Low' | 'Medium' | 'High' | 'Critical'>('High');
+  const [logError, setLogError] = useState('');
+  const canLogFailure = canRunAction(session?.role, 'log_failure');
+  const canViewCompliance = canRunAction(session?.role, 'view_compliance');
 
   if (!asset && !remoteChecked) {
     return (
@@ -149,9 +158,9 @@ export default function AssetProfilePage({ params }: { params: { tag: string } }
     : documents.filter(d => asset.documents.includes(d.id));
 
   // Find asset-specific compliance gaps
-  const assetGaps = remoteGaps.length > 0
+  const assetGaps = canViewCompliance ? (remoteGaps.length > 0
     ? remoteGaps
-    : complianceGaps.filter(g => g.assetTag.toUpperCase() === asset.assetTag.toUpperCase());
+    : complianceGaps.filter(g => g.assetTag.toUpperCase() === asset.assetTag.toUpperCase())) : [];
   const inspectionDocs = linkedDocuments.filter(doc => doc.documentType.toLowerCase().includes('inspection'));
   const maintenanceDocs = linkedDocuments.filter(doc => doc.documentType.toLowerCase().includes('maintenance') || doc.title.toLowerCase().includes('work order'));
   const openRisks = [
@@ -165,6 +174,13 @@ export default function AssetProfilePage({ params }: { params: { tag: string } }
 
   const handleLogFailure = (e: React.FormEvent) => {
     e.preventDefault();
+    setLogError('');
+
+    if (!canLogFailure) {
+      setLogError(getDeniedMessage(session?.role, 'log_failure'));
+      return;
+    }
+
     if (description.trim()) {
       addFailureEvent(asset.assetTag, description, severity);
       setDescription('');
@@ -281,8 +297,13 @@ export default function AssetProfilePage({ params }: { params: { tag: string } }
                 </div>
                 
                 <button
-                  onClick={() => setShowLogForm(!showLogForm)}
-                  className="px-2.5 py-1.5 bg-cyber-emerald hover:bg-emerald-600 active:bg-emerald-700 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1 transition-all"
+                  onClick={() => {
+                    setLogError('');
+                    setShowLogForm(!showLogForm);
+                  }}
+                  disabled={!canLogFailure}
+                  title={!canLogFailure ? getDeniedMessage(session?.role, 'log_failure') : undefined}
+                  className="px-2.5 py-1.5 bg-cyber-emerald hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed active:bg-emerald-700 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1 transition-all"
                 >
                   <PlusCircle className="w-3.5 h-3.5" /> Log Failure
                 </button>
@@ -294,6 +315,13 @@ export default function AssetProfilePage({ params }: { params: { tag: string } }
                   <h4 className="text-xs font-bold text-cyber-emerald uppercase tracking-wider">Report Operational Event</h4>
                   
                   <form onSubmit={handleLogFailure} className="space-y-3">
+                    {logError && (
+                      <div className="p-3 bg-cyber-amber/5 border border-cyber-amber/20 text-amber-200 rounded-xl text-xs flex gap-2">
+                        <AlertTriangle className="w-4 h-4 shrink-0 text-cyber-amber" />
+                        <span>{logError}</span>
+                      </div>
+                    )}
+
                     <div>
                       <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Failure Description</label>
                       <input 
@@ -404,38 +432,40 @@ export default function AssetProfilePage({ params }: { params: { tag: string } }
           <div className="lg:col-span-1 space-y-6">
             
             {/* Active Gaps */}
-            <div className="glass-panel p-6 rounded-2xl border-slate-800/80">
-              <h3 className="text-xs font-bold text-white tracking-wider uppercase mb-4 flex items-center gap-1.5">
-                <ShieldAlert className="w-4 h-4 text-cyber-rose" /> Compliance Gaps
-              </h3>
+            {canViewCompliance && (
+              <div className="glass-panel p-6 rounded-2xl border-slate-800/80">
+                <h3 className="text-xs font-bold text-white tracking-wider uppercase mb-4 flex items-center gap-1.5">
+                  <ShieldAlert className="w-4 h-4 text-cyber-rose" /> Compliance Gaps
+                </h3>
 
-              <div className="space-y-3">
-                {assetGaps.length > 0 ? (
-                  assetGaps.map(gap => (
-                    <div 
-                      key={gap.id}
-                      className="p-3 bg-[#060918]/60 border border-slate-800 rounded-xl text-xs space-y-1.5"
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="font-bold text-slate-200">{gap.gapType}</span>
-                        <span className={`text-[8px] font-mono uppercase px-1.5 py-0.5 rounded border ${
-                          gap.severity === 'Critical' ? 'bg-cyber-rose/10 text-cyber-rose border-cyber-rose/20' :
-                          gap.severity === 'High' ? 'bg-cyber-amber/10 text-cyber-amber border-cyber-amber/20' :
-                          'bg-slate-800 text-slate-400 border-slate-700'
-                        }`}>
-                          {gap.severity}
-                        </span>
+                <div className="space-y-3">
+                  {assetGaps.length > 0 ? (
+                    assetGaps.map(gap => (
+                      <div
+                        key={gap.id}
+                        className="p-3 bg-[#060918]/60 border border-slate-800 rounded-xl text-xs space-y-1.5"
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-slate-200">{gap.gapType}</span>
+                          <span className={`text-[8px] font-mono uppercase px-1.5 py-0.5 rounded border ${
+                            gap.severity === 'Critical' ? 'bg-cyber-rose/10 text-cyber-rose border-cyber-rose/20' :
+                            gap.severity === 'High' ? 'bg-cyber-amber/10 text-cyber-amber border-cyber-amber/20' :
+                            'bg-slate-800 text-slate-400 border-slate-700'
+                          }`}>
+                            {gap.severity}
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-slate-400">{gap.description}</p>
                       </div>
-                      <p className="text-[10px] text-slate-400">{gap.description}</p>
+                    ))
+                  ) : (
+                    <div className="py-6 text-center text-slate-500 font-mono text-xs border border-dashed border-slate-800 rounded-xl">
+                      No active compliance gaps.
                     </div>
-                  ))
-                ) : (
-                  <div className="py-6 text-center text-slate-500 font-mono text-xs border border-dashed border-slate-800 rounded-xl">
-                    No active compliance gaps.
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
-            </div>
+            )}
 
             <div className="glass-panel p-6 rounded-2xl border-slate-800/80">
               <h3 className="text-xs font-bold text-white tracking-wider uppercase mb-4 flex items-center gap-1.5">

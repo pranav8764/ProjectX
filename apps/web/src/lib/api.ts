@@ -2,6 +2,7 @@ export const DEFAULT_DEV_TOKEN = 'dev-token';
 const SESSION_KEY = 'plantbrain_session';
 const TOKEN_KEY = 'plantbrain_api_token';
 const DEFAULT_SESSION_MS = 8 * 60 * 60 * 1000;
+export const API_FORBIDDEN_EVENT = 'plantbrain:api-forbidden';
 
 export interface PlantBrainSession {
   name: string;
@@ -14,6 +15,17 @@ export interface PlantBrainSession {
   plantName?: string;
   organizationName?: string;
   expiresAt?: string;
+}
+
+export type DocumentAccessLevel = 'public' | 'internal' | 'restricted' | 'confidential';
+export type DocumentSensitivity = 'standard' | 'sensitive' | 'confidential' | 'safety_critical';
+
+export interface DocumentAccessFields {
+  accessLevel?: DocumentAccessLevel | string | null;
+  sensitivity?: DocumentSensitivity | string | null;
+  allowedRoles?: string[] | null;
+  sourceRestricted?: boolean | null;
+  sourceDownloadAllowed?: boolean | null;
 }
 
 export function getStoredSession(): PlantBrainSession | null {
@@ -94,11 +106,33 @@ export async function apiFetch(path: string, init: RequestInit = {}) {
     headers: authHeaders(init.headers),
   });
 
-  if (response.status === 401 || response.status === 403) {
+  if (response.status === 401) {
     clearStoredSession();
   }
 
+  if (response.status === 403 && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(API_FORBIDDEN_EVENT, {
+      detail: { path, method: init.method || 'GET' },
+    }));
+  }
+
   return response;
+}
+
+export async function readApiError(response: Response, fallback: string) {
+  const contentType = response.headers.get('content-type') || '';
+
+  try {
+    if (contentType.includes('application/json')) {
+      const body = await response.json();
+      return String(body.error || body.message || fallback);
+    }
+
+    const text = await response.text();
+    return text.trim() || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export function appendPlantQuery(path: string, plantId = getPlantId()) {

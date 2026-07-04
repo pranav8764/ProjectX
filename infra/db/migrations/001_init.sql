@@ -96,12 +96,20 @@ create table if not exists document.documents (
   plant_id uuid not null,
   title text not null,
   document_type text,
+  access_level text not null default 'internal',
+  sensitivity text not null default 'standard',
+  allowed_roles text[] not null default '{}'::text[],
   current_version_id uuid,
   status text not null default 'UPLOADED',
   uploaded_by uuid,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  constraint documents_access_level_check check (access_level in ('public', 'internal', 'restricted', 'confidential')),
+  constraint documents_sensitivity_check check (sensitivity in ('standard', 'sensitive', 'confidential', 'safety_critical'))
 );
+
+create index if not exists documents_access_idx
+  on document.documents (organization_id, plant_id, access_level);
 
 create table if not exists document.document_versions (
   id uuid primary key default gen_random_uuid(),
@@ -141,10 +149,24 @@ create table if not exists ingestion.processing_jobs (
   status text not null default 'QUEUED',
   error_message text,
   attempts integer not null default 0,
+  progress numeric not null default 0,
+  last_attempted_at timestamptz,
+  next_retry_at timestamptz,
+  locked_at timestamptz,
+  locked_by text,
+  metadata_json jsonb not null default '{}',
   started_at timestamptz,
   completed_at timestamptz,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
+
+create unique index if not exists processing_jobs_document_version_idx
+  on ingestion.processing_jobs (document_id, document_version_id);
+
+create index if not exists processing_jobs_retry_idx
+  on ingestion.processing_jobs (status, next_retry_at)
+  where status in ('QUEUED', 'FAILED');
 
 create table if not exists ingestion.document_pages (
   id uuid primary key default gen_random_uuid(),
@@ -306,6 +328,14 @@ create table if not exists compliance.gaps (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+create unique index if not exists compliance_gaps_open_requirement_idx
+  on compliance.gaps (organization_id, plant_id, asset_id, requirement_id, gap_type)
+  where status = 'OPEN' and requirement_id is not null;
+
+create unique index if not exists compliance_gaps_open_evidence_idx
+  on compliance.gaps (organization_id, plant_id, asset_id, gap_type, evidence_document_id)
+  where status = 'OPEN' and evidence_document_id is not null;
 
 create table if not exists report.jobs (
   id uuid primary key default gen_random_uuid(),

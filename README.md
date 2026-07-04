@@ -60,11 +60,7 @@ ProjectX/
 
 ## Getting Started
 
-Copy the environment template:
-
-```bash
-cp .env.example .env
-```
+The Docker Compose stack has local defaults for Postgres, Redis, MinIO, the Go API, and the Python AI service. Copy `.env.example` to `.env` in the root directory and fill in the required variables before starting. Add `GOOGLE_API_KEY` and/or `GROQ_API_KEY` to your `.env` only when you want live LLM/embedding calls instead of fallback responses.
 
 Install the web dependencies once:
 
@@ -84,7 +80,7 @@ Primary starting points:
 
 - `apps/web`: Next.js + TypeScript application
 - `services/api`: Go API/BFF
-- `services/ai`: Python FastAPI AI and ingestion service
+- `services/ai`: Python FastAPI AI service
 - `infra/db`: PostgreSQL + pgvector migrations and demo seeds
 
 Local service URLs:
@@ -95,5 +91,14 @@ Local service URLs:
 - MinIO console: `http://localhost:9001`
 
 The Go API seeds a local development session token, `dev-token`, when the database is empty and `APP_ENV` is not `production`.
+
+Useful checks:
+
+```bash
+make compose-config
+make smoke
+make test-api
+make test-ai
+```
 
 For the complete service map, read `docs/MICROSERVICES.md`. For deployment commands, read `docs/DEPLOYMENT.md`.

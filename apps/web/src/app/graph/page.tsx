@@ -1,8 +1,10 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import NavigationShell from '../../components/NavigationShell';
 import { useData } from '../../context/DataContext';
+import { getStoredSession, PlantBrainSession } from '../../lib/api';
+import { canRunAction } from '../../lib/permissions';
 import { Activity, AlertTriangle, FileText, Network, ShieldAlert } from 'lucide-react';
 import Link from 'next/link';
 
@@ -12,6 +14,14 @@ export default function KnowledgeGraphPage() {
   const { assets, documents, complianceGaps } = useData();
   const [mode, setMode] = useState<GraphMode>('all');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [session, setSession] = useState<PlantBrainSession | null>(null);
+
+  useEffect(() => {
+    setSession(getStoredSession());
+  }, []);
+
+  const canViewCompliance = canRunAction(session?.role, 'view_compliance');
+  const visibleGaps = canViewCompliance ? complianceGaps : [];
 
   const nodes = useMemo(() => {
     const assetNodes = assets.map((asset, index) => ({
@@ -34,7 +44,7 @@ export default function KnowledgeGraphPage() {
       risk: 0,
     }));
 
-    const gapNodes = complianceGaps.map((gap, index) => ({
+    const gapNodes = visibleGaps.map((gap, index) => ({
       id: gap.id,
       label: gap.gapType,
       subtitle: gap.assetTag,
@@ -47,7 +57,7 @@ export default function KnowledgeGraphPage() {
     if (mode === 'assets') return [...assetNodes, ...documentNodes];
     if (mode === 'gaps') return [...assetNodes, ...gapNodes];
     return [...assetNodes, ...documentNodes, ...gapNodes];
-  }, [assets, complianceGaps, documents, mode]);
+  }, [assets, visibleGaps, documents, mode]);
 
   const edges = useMemo(() => {
     const docEdges = assets.flatMap(asset =>
@@ -56,7 +66,7 @@ export default function KnowledgeGraphPage() {
         .map(doc => ({ from: asset.assetTag, to: doc.id, kind: 'document' }))
     );
 
-    const gapEdges = complianceGaps.map(gap => ({
+    const gapEdges = visibleGaps.map(gap => ({
       from: gap.assetTag,
       to: gap.id,
       kind: 'gap',
@@ -65,7 +75,7 @@ export default function KnowledgeGraphPage() {
     if (mode === 'assets') return docEdges;
     if (mode === 'gaps') return gapEdges;
     return [...docEdges, ...gapEdges];
-  }, [assets, complianceGaps, documents, mode]);
+  }, [assets, visibleGaps, documents, mode]);
 
   const nodeById = new Map(nodes.map(node => [node.id, node]));
   const selectedNode = selectedNodeId ? nodeById.get(selectedNodeId) : null;
@@ -79,7 +89,7 @@ export default function KnowledgeGraphPage() {
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <Metric label="Assets" value={assets.length} icon={<Network className="w-5 h-5" />} />
           <Metric label="Documents" value={documents.length} icon={<FileText className="w-5 h-5" />} />
-          <Metric label="Open Gaps" value={complianceGaps.filter(g => g.status === 'Open').length} icon={<ShieldAlert className="w-5 h-5" />} />
+          {canViewCompliance && <Metric label="Open Gaps" value={visibleGaps.filter(g => g.status === 'Open').length} icon={<ShieldAlert className="w-5 h-5" />} />}
           <Metric label="High Risk" value={assets.filter(a => a.riskScore >= 70).length} icon={<AlertTriangle className="w-5 h-5" />} />
         </div>
 
@@ -94,7 +104,7 @@ export default function KnowledgeGraphPage() {
               {[
                 ['all', 'All'],
                 ['assets', 'Documents'],
-                ['gaps', 'Gaps'],
+                ...(canViewCompliance ? [['gaps', 'Gaps']] : []),
               ].map(([value, label]) => (
                 <button
                   key={value}
@@ -193,7 +203,7 @@ export default function KnowledgeGraphPage() {
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {assets
-            .filter(asset => asset.riskScore >= 60 || asset.complianceGaps.length > 0)
+            .filter(asset => asset.riskScore >= 60 || (canViewCompliance && asset.complianceGaps.length > 0))
             .slice(0, 4)
             .map(asset => (
               <Link

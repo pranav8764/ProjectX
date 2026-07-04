@@ -4,6 +4,7 @@ import logging
 import uuid
 import json
 import re
+import hashlib
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 
@@ -89,23 +90,43 @@ class DocumentProcessRequest(BaseModel):
 class CopilotQueryRequest(BaseModel):
     question: str
     plantId: str
+    userId: Optional[str] = None
+    organizationId: Optional[str] = None
+    userRole: Optional[str] = None
     filters: Optional[Dict[str, Any]] = None
 
 class RCAGenerateRequest(BaseModel):
     assetTag: str
     failureDescription: str
+    plantId: Optional[str] = None
+    userId: Optional[str] = None
+    organizationId: Optional[str] = None
 
 # Helper: Gemini 1536-dim Embedding Generator
+def deterministic_embedding_1536(text: str) -> List[float]:
+    """Stable local fallback embedding so retrieval never degrades to identical zero vectors."""
+    seed = hashlib.sha256((text or "").encode("utf-8")).digest()
+    values = []
+    counter = 0
+    while len(values) < 1536:
+        digest = hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
+        for byte in digest:
+            values.append((byte / 127.5) - 1.0)
+            if len(values) == 1536:
+                break
+        counter += 1
+    norm = float(np.linalg.norm(values)) or 1.0
+    return [v / norm for v in values]
+
 async def get_gemini_embedding_1536(text: str) -> List[float]:
     """
     Generates 1536-dimensional embeddings using Gemini text-embedding-004.
-    Since text-embedding-004 produces 768 dimensions by default, we concatenate the vector 
+    Since text-embedding-004 produces 768 dimensions by default, we concatenate the vector
     with itself to yield exactly 1536 dimensions. This preserves cosine similarity mathematically.
     """
     if not GOOGLE_API_KEY:
-        # Return fallback zero embedding if no key is provided
-        return [0.0] * 1536
-    
+        return deterministic_embedding_1536(text)
+
     try:
         # Run synchronous call in thread pool to avoid blocking async loop
         loop = asyncio.get_event_loop()
@@ -123,8 +144,7 @@ async def get_gemini_embedding_1536(text: str) -> List[float]:
         return emb_1536
     except Exception as e:
         logger.error(f"Error generating Gemini embedding: {e}")
-        # Return fallback zero embedding
-        return [0.0] * 1536
+        return deterministic_embedding_1536(text)
 
 # Helper: LLM Generator
 async def generate_text_llm(prompt: str) -> str:
@@ -137,7 +157,7 @@ async def generate_text_llm(prompt: str) -> str:
             return response.text.strip()
         except Exception as e:
             logger.warning(f"Gemini generation failed: {e}. Falling back to Groq...")
-    
+
     if groq_client:
         try:
             loop = asyncio.get_event_loop()
@@ -152,8 +172,188 @@ async def generate_text_llm(prompt: str) -> str:
             return response.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"Groq generation failed: {e}")
-            
+
     return "AI generation unavailable. Please check API keys configuration."
+
+def optional_uuid(value: Optional[str]) -> Optional[uuid.UUID]:
+    if not value:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError):
+        return None
+
+def extract_asset_tags(text: str) -> List[str]:
+    seen = set()
+    tags = []
+    for match in re.finditer(r"\b(?!(?:VERSION|PAGE|REV|TABLE|FIG|FIGURE)\b)[A-Z]+[-\s]*\d+[A-Z]*\b", text.upper()):
+        tag = re.sub(r"\s+", "-", match.group()).strip("-")
+        if tag and tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+    return tags
+
+ROLE_ALIASES = {
+    "administrator": "admin",
+    "plant_manager": "plant_manager",
+    "manager": "plant_manager",
+    "maintenance_engineer": "engineer",
+    "reliability_engineer": "engineer",
+    "plant_engineer": "engineer",
+    "field_technician": "technician",
+    "plant_operator": "technician",
+    "operator": "technician",
+    "compliance": "compliance_officer",
+    "readonly": "viewer",
+    "read_only": "viewer",
+}
+RESTRICTED_DOCUMENT_ROLES = {"admin", "plant_manager", "engineer", "compliance_officer"}
+PUBLIC_ACCESS_LEVELS = {"", "public", "open", "internal", "organization", "org", "plant", "general", "unrestricted"}
+RESTRICTED_ACCESS_LEVELS = {"restricted", "confidential", "sensitive", "private", "controlled", "compliance", "audit", "regulated"}
+
+def row_get(row: Any, key: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+def normalize_role_name(role: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(role or "").strip().lower()).strip("_")
+    if not normalized:
+        return "viewer"
+    return ROLE_ALIASES.get(normalized, normalized)
+
+def normalize_access_level(access_level: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(access_level or "").strip().lower()).strip("_")
+
+def parse_allowed_roles(value: Any) -> List[str]:
+    if value is None:
+        return []
+
+    parsed_value = value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed_value = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed_value = re.split(r"[,;]", stripped)
+
+    if isinstance(parsed_value, dict):
+        parsed_value = (
+            parsed_value.get("roles")
+            or parsed_value.get("allowedRoles")
+            or parsed_value.get("allowed_roles")
+            or list(parsed_value.values())
+        )
+
+    if isinstance(parsed_value, (list, tuple, set)):
+        return [normalize_role_name(role) for role in parsed_value if str(role or "").strip()]
+
+    return [normalize_role_name(parsed_value)] if str(parsed_value or "").strip() else []
+
+def request_role_hint(request: CopilotQueryRequest) -> Optional[str]:
+    for attr in ("userRole", "role"):
+        value = getattr(request, attr, None)
+        if value:
+            return value
+
+    filters = getattr(request, "filters", None) or {}
+    if isinstance(filters, dict):
+        for key in ("userRole", "role", "currentUserRole"):
+            if filters.get(key):
+                return filters[key]
+    return None
+
+async def resolve_request_role(conn: Any, request: CopilotQueryRequest, plant_uuid: uuid.UUID, org_id: uuid.UUID) -> str:
+    role_hint = request_role_hint(request)
+    user_uuid = optional_uuid(getattr(request, "userId", None))
+    if user_uuid:
+        try:
+            role_row = await conn.fetchrow("""
+                SELECT r.name AS role
+                FROM identity.memberships m
+                JOIN identity.roles r ON m.role_id = r.id
+                WHERE m.user_id = $1
+                  AND m.organization_id = $2
+                  AND (m.plant_id IS NULL OR m.plant_id = $3)
+                ORDER BY CASE WHEN m.plant_id = $3 THEN 0 ELSE 1 END
+                LIMIT 1
+            """, user_uuid, org_id, plant_uuid)
+            db_role = row_get(role_row, "role")
+            if db_role:
+                return normalize_role_name(db_role)
+        except Exception as e:
+            logger.warning(f"Unable to resolve user role for RAG access filtering: {e}")
+    return normalize_role_name(role_hint)
+
+async def get_document_access_columns(conn: Any) -> set:
+    try:
+        rows = await conn.fetch("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'document'
+              AND table_name = 'documents'
+              AND column_name IN ('access_level', 'allowed_roles')
+        """)
+        return {row_get(row, "column_name") for row in rows if row_get(row, "column_name")}
+    except Exception as e:
+        logger.warning(f"Unable to inspect document access columns; defaulting to legacy-compatible retrieval: {e}")
+        return set()
+
+def document_access_select(access_columns: set) -> str:
+    access_expr = "d.access_level" if "access_level" in access_columns else "NULL"
+    roles_expr = "d.allowed_roles" if "allowed_roles" in access_columns else "NULL"
+    return f"{access_expr} AS access_level, {roles_expr} AS allowed_roles"
+
+def document_row_access_allowed(row: Any, user_role: str) -> bool:
+    role = normalize_role_name(user_role)
+    if role == "admin":
+        return True
+
+    allowed_roles = parse_allowed_roles(row_get(row, "allowed_roles"))
+    if allowed_roles:
+        return role in allowed_roles
+
+    access_level = normalize_access_level(row_get(row, "access_level"))
+    if access_level in PUBLIC_ACCESS_LEVELS:
+        return True
+    if access_level in RESTRICTED_ACCESS_LEVELS:
+        return role in RESTRICTED_DOCUMENT_ROLES
+
+    # Unknown or legacy access labels are treated as accessible unless explicit roles say otherwise.
+    return True
+
+def graceful_query_response(question: str, reason: str) -> Dict[str, Any]:
+    missing_info = ["Not enough evidence is available because the AI retrieval path could not complete."]
+    if reason:
+        missing_info.append(reason)
+    return {
+        "answer": "Not enough evidence is available to answer safely right now.",
+        "confidence": 0.0,
+        "citations": [],
+        "relatedAssets": extract_asset_tags(question),
+        "missingInfo": missing_info,
+        "fallback": True
+    }
+
+def graceful_rca_response(asset_tag: str, reason: str) -> Dict[str, Any]:
+    missing_data = ["RCA could not be generated from evidence because the AI path could not complete."]
+    if reason:
+        missing_data.append(reason)
+    normalized_tag = asset_tag.upper().strip() if asset_tag else "the requested asset"
+    return {
+        "summary": f"RCA for {normalized_tag} could not be generated safely right now.",
+        "probableCauses": ["Data unavailable"],
+        "recommendations": ["Retry after AI processing is healthy", "Review available work orders and inspection records manually before taking action"],
+        "confidence": 0.0,
+        "citations": [],
+        "missingData": missing_data,
+        "fallback": True
+    }
 
 # --- DOCUMENT PROCESSING PIPELINE ---
 
@@ -164,97 +364,205 @@ async def process_document(request: DocumentProcessRequest, background_tasks: Ba
     return {"message": "Document processing started", "document_id": request.document_id}
 
 async def run_ingestion_pipeline(document_id: str, file_path: str, file_type: str, metadata: Dict[str, Any]):
+    if not db_pool:
+        logger.error("Cannot process document %s because database pool is unavailable", document_id)
+        return
+
+    document_version_id = None
     try:
         logger.info(f"Starting ingestion pipeline for document {document_id}")
-        await update_status(document_id, "EXTRACTING_TEXT", 0.1)
 
         # 1. Fetch document version from database
         async with db_pool.acquire() as conn:
             version_row = await conn.fetchrow("""
-                SELECT id FROM document.document_versions 
-                WHERE document_id = $1 ORDER BY created_at DESC LIMIT 1
+                SELECT COALESCE(d.current_version_id, v.id) AS id
+                FROM document.documents d
+                LEFT JOIN LATERAL (
+                    SELECT id
+                    FROM document.document_versions
+                    WHERE document_id = d.id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                ) v ON true
+                WHERE d.id = $1
             """, uuid.UUID(document_id))
-            if not version_row:
+            if not version_row or not version_row["id"]:
                 raise Exception(f"No document version found for document {document_id}")
             document_version_id = version_row['id']
+
+        await update_status(document_id, "EXTRACTING_TEXT", 0.1, document_version_id=document_version_id)
 
         # 2. Extract Text & OCR Fallback
         text_content = ""
         pages = []  # List of tuples: (page_no, text)
-        
+
         if file_type.lower() == "pdf":
             pages = await extract_pdf_pages(file_path)
+
+            # Mixed content & Garbled text
+            final_pages = []
+            ocr_needed_pages = []
+            for p_idx, text in pages:
+                text_strip = text.strip()
+                alnum_count = sum(c.isalnum() for c in text_strip)
+                alnum_ratio = alnum_count / len(text_strip) if len(text_strip) > 0 else 1.0
+
+                if len(text_strip) < 50 or (len(text_strip) > 0 and alnum_ratio < 0.5):
+                    ocr_needed_pages.append(p_idx)
+                else:
+                    final_pages.append((p_idx, text))
+
+            if ocr_needed_pages:
+                logger.info(f"Running OCR fallback for {len(ocr_needed_pages)} pages...")
+                await update_status(document_id, "OCR_RUNNING", 0.3, document_version_id=document_version_id)
+                ocr_results = await ocr_pdf_pages(file_path, pages_to_ocr=ocr_needed_pages)
+                for p in ocr_results:
+                    final_pages.append(p)
+
+            final_pages.sort(key=lambda x: x[0])
+            pages = final_pages
             text_content = "\n".join([p[1] for p in pages])
-            
-            # OCR Fallback
-            if len(text_content.strip()) < 50:
-                logger.info(f"Insufficient text extracted ({len(text_content)} chars). Running OCR fallback...")
-                await update_status(document_id, "OCR_RUNNING", 0.3)
-                pages = await ocr_pdf_pages(file_path)
-                text_content = "\n".join([p[1] for p in pages])
         else:
             single_text = await extract_generic_text(file_path, file_type)
             pages = [(1, single_text)]
             text_content = single_text
 
         # 3. Convert to Markdown
-        await update_status(document_id, "CONVERTING_TO_MARKDOWN", 0.5)
+        await update_status(document_id, "CONVERTING_TO_MARKDOWN", 0.5, document_version_id=document_version_id)
         markdown_content = convert_to_markdown(text_content, file_type)
 
+        await update_status(document_id, "CLASSIFYING", 0.55, document_version_id=document_version_id)
+
         # 4. Extract Tables
-        await update_status(document_id, "DETECTING_TABLES", 0.6)
+        await update_status(document_id, "DETECTING_TABLES", 0.6, document_version_id=document_version_id)
         tables = await extract_tables(file_path, file_type)
 
         # 5. Token-Aware Chunking (500-800 tokens, 100 overlap)
-        await update_status(document_id, "CHUNKING", 0.7)
+        await update_status(document_id, "CHUNKING", 0.7, document_version_id=document_version_id)
         chunks = chunk_document_pages(pages)
+        partial_reasons = []
+        if not text_content.strip():
+            partial_reasons.append("No extractable text was found after native extraction and OCR fallback.")
+        if text_content.strip() and not chunks:
+            partial_reasons.append("Extracted text could not be converted into searchable chunks.")
+        if not tables and file_type.lower() in {"xlsx", "xls", "csv"}:
+            partial_reasons.append("No structured table data was detected in the spreadsheet or CSV file.")
 
         # 6. Extract Entities
-        await update_status(document_id, "EXTRACTING_ENTITIES", 0.8)
+        await update_status(document_id, "EXTRACTING_ENTITIES", 0.8, document_version_id=document_version_id)
         entities = extract_entities(chunks)
 
         # 7. Generate 1536-dimensional Gemini Embeddings
-        await update_status(document_id, "GENERATING_EMBEDDINGS", 0.9)
+        await update_status(document_id, "GENERATING_EMBEDDINGS", 0.9, document_version_id=document_version_id)
         embeddings = []
         for chunk in chunks:
             emb = await get_gemini_embedding_1536(chunk["text"])
             embeddings.append(emb)
 
         # 8. Store Results in Database
-        await update_status(document_id, "STORING_RESULTS", 0.95)
+        await update_status(document_id, "STORING_RESULTS", 0.95, document_version_id=document_version_id)
         await save_ingestion_results(
             document_id, document_version_id, markdown_content, pages, chunks, entities, embeddings, tables
         )
 
+        await update_status(document_id, "BUILDING_GRAPH", 0.98, document_version_id=document_version_id)
+
         # 9. Mark Completed
-        await update_status(document_id, "COMPLETED", 1.0)
+        if not text_content.strip() and not tables and not entities:
+            error_msg = "Corrupt or empty document: no text, tables, or entities extracted."
+            await update_status(document_id, "FAILED", 0.0, error_msg, document_version_id=document_version_id)
+            logger.error(f"Document {document_id} failed processing: {error_msg}")
+            return
+
+        if partial_reasons:
+            partial_reason = " ".join(partial_reasons)
+            await update_status(document_id, "PARTIAL_SUCCESS", 1.0, partial_reason, document_version_id=document_version_id)
+            logger.warning(f"Document {document_id} partially processed: {partial_reason}")
+            return
+        await update_status(document_id, "COMPLETED", 1.0, document_version_id=document_version_id)
         logger.info(f"Document {document_id} processed successfully!")
 
     except Exception as e:
         logger.error(f"Failed to process document {document_id}: {e}", exc_info=True)
-        await update_status(document_id, "FAILED", 0.0, str(e))
+        await update_status(document_id, "FAILED", 0.0, str(e), document_version_id=document_version_id)
 
-async def update_status(document_id: str, status: str, progress: float, error_message: str = None):
+async def update_status(
+    document_id: str,
+    status: str,
+    progress: float,
+    error_message: str = None,
+    document_version_id: Optional[uuid.UUID] = None,
+):
     """Updates document.documents and ingestion.processing_jobs"""
     if not db_pool:
         return
     try:
         doc_uuid = uuid.UUID(document_id)
+        version_uuid = uuid.UUID(str(document_version_id)) if document_version_id else None
+        terminal_status = status in {"COMPLETED", "FAILED", "PARTIAL_SUCCESS", "ARCHIVED"}
+        increment_attempts = status == "EXTRACTING_TEXT"
         async with db_pool.acquire() as conn:
+            if not version_uuid:
+                version_row = await conn.fetchrow("""
+                    SELECT COALESCE(d.current_version_id, v.id) AS id
+                    FROM document.documents d
+                    LEFT JOIN LATERAL (
+                        SELECT id
+                        FROM document.document_versions
+                        WHERE document_id = d.id
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    ) v ON true
+                    WHERE d.id = $1
+                """, doc_uuid)
+                if not version_row or not version_row["id"]:
+                    logger.warning("Cannot update processing status for document %s without a document version", document_id)
+                    return
+                version_uuid = version_row["id"]
+
             await conn.execute("""
-                UPDATE document.documents 
-                SET status = $1, updated_at = NOW() 
+                UPDATE document.documents
+                SET status = $1, updated_at = NOW()
                 WHERE id = $2
-            """, status, doc_uuid)
-            
+                  AND (current_version_id IS NULL OR current_version_id = $3)
+            """, status, doc_uuid, version_uuid)
+
             await conn.execute("""
-                INSERT INTO ingestion.processing_jobs (document_id, document_version_id, status, error_message, attempts, started_at)
-                SELECT $1, id, $2, $3, 1, NOW()
-                FROM document.document_versions
-                WHERE document_id = $1
-                ORDER BY created_at DESC LIMIT 1
-                ON CONFLICT DO NOTHING
-            """, doc_uuid, status, error_message)
+                INSERT INTO ingestion.processing_jobs (
+                    document_id, document_version_id, status, error_message, attempts, progress,
+                    last_attempted_at, next_retry_at, locked_at, locked_by, metadata_json,
+                    started_at, completed_at, created_at, updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, CASE WHEN $6 THEN 1 ELSE 0 END, $5,
+                    CASE WHEN $6 THEN NOW() ELSE NULL END,
+                    CASE
+                        WHEN $3 = 'QUEUED' THEN NOW()
+                        WHEN $3 = 'FAILED' THEN NOW() + (INTERVAL '1 minute' * POWER(2, CASE WHEN $6 THEN 1 ELSE 0 END))
+                        ELSE NULL
+                    END,
+                    NULL, NULL, jsonb_build_object('lastTransition', $3, 'source', 'ai_service'),
+                    NOW(), CASE WHEN $7 THEN NOW() ELSE NULL END, NOW(), NOW()
+                )
+                ON CONFLICT (document_id, document_version_id)
+                DO UPDATE SET
+                    status = EXCLUDED.status,
+                    error_message = EXCLUDED.error_message,
+                    progress = EXCLUDED.progress,
+                    attempts = ingestion.processing_jobs.attempts + CASE WHEN $6 THEN 1 ELSE 0 END,
+                    last_attempted_at = CASE WHEN $6 THEN NOW() ELSE ingestion.processing_jobs.last_attempted_at END,
+                    next_retry_at = CASE
+                        WHEN EXCLUDED.status = 'QUEUED' THEN NOW()
+                        WHEN EXCLUDED.status = 'FAILED' THEN NOW() + (INTERVAL '1 minute' * POWER(2, ingestion.processing_jobs.attempts + CASE WHEN $6 THEN 1 ELSE 0 END))
+                        ELSE NULL
+                    END,
+                    locked_at = NULL,
+                    locked_by = NULL,
+                    metadata_json = ingestion.processing_jobs.metadata_json || EXCLUDED.metadata_json,
+                    started_at = CASE WHEN $6 THEN NOW() ELSE COALESCE(ingestion.processing_jobs.started_at, NOW()) END,
+                    completed_at = CASE WHEN $7 THEN NOW() ELSE NULL END,
+                    updated_at = NOW()
+            """, doc_uuid, version_uuid, status, error_message, progress, increment_attempts, terminal_status)
     except Exception as e:
         logger.error(f"Error updating processing status: {e}")
 
@@ -279,15 +587,26 @@ async def extract_pdf_pages(file_path: str) -> List[tuple]:
             logger.error(f"PyPDF2 also failed: {e2}")
     return pages
 
-async def ocr_pdf_pages(file_path: str) -> List[tuple]:
+async def ocr_pdf_pages(file_path: str, pages_to_ocr: Optional[List[int]] = None) -> List[tuple]:
     pages = []
     try:
         loop = asyncio.get_event_loop()
-        # Convert pages to images in a background thread to prevent blocking
-        images = await loop.run_in_executor(None, lambda: pdf2image.convert_from_path(file_path))
-        for i, img in enumerate(images):
-            text = await loop.run_in_executor(None, lambda image=img: pytesseract.image_to_string(image))
-            pages.append((i + 1, text or ""))
+        # Get total number of pages to avoid loading all at once
+        info = await loop.run_in_executor(None, lambda: pdf2image.pdfinfo_from_path(file_path))
+        num_pages = int(info["Pages"])
+
+        for i in range(1, num_pages + 1):
+            if pages_to_ocr and i not in pages_to_ocr:
+                continue
+            # Load one page at a time
+            images = await loop.run_in_executor(
+                None,
+                lambda page=i: pdf2image.convert_from_path(file_path, first_page=page, last_page=page)
+            )
+            if images:
+                img = images[0]
+                text = await loop.run_in_executor(None, lambda image=img: pytesseract.image_to_string(image))
+                pages.append((i, text or ""))
     except Exception as e:
         logger.error(f"OCR pdf pages failed: {e}")
     return pages
@@ -377,18 +696,18 @@ async def extract_tables(file_path: str, file_type: str) -> List[Dict]:
 def chunk_document_pages(pages: List[tuple]) -> List[Dict]:
     """
     Token-aware chunker.
-    Groups lines/sentences to target chunks between 500 and 800 tokens, 
+    Groups lines/sentences to target chunks between 500 and 800 tokens,
     with a 100 token overlap (approximated as 4 characters per token).
     """
     chunks = []
     chunk_size_chars = 600 * 4   # ~600 tokens
     overlap_chars = 100 * 4      # ~100 tokens
-    
+
     for page_no, text in pages:
         text = text.strip()
         if not text:
             continue
-            
+
         start = 0
         while start < len(text):
             end = start + chunk_size_chars
@@ -398,7 +717,7 @@ def chunk_document_pages(pages: List[tuple]) -> List[Dict]:
                     if text[i] in ".!?":
                         end = i + 1
                         break
-            
+
             chunk_text = text[start:end].strip()
             if chunk_text:
                 chunks.append({
@@ -406,25 +725,29 @@ def chunk_document_pages(pages: List[tuple]) -> List[Dict]:
                     "text": chunk_text,
                     "chunk_index": len(chunks)
                 })
-                
+
             start = end - overlap_chars
             if start >= len(text):
                 break
-                
+
     return chunks
 
 def extract_entities(chunks: List[Dict]) -> List[Dict]:
     entities = []
-    
+
     # Regexes for equipment tags, measurements, regulations, and dates
-    tag_pattern = re.compile(r"\b[A-Z]+[-\s]*\d+[A-Z]*\b")
+    tag_pattern = re.compile(r"\b(?!(?:VERSION|PAGE|REV|TABLE|FIG|FIGURE)\b)[A-Z]+[-\s]*\d+[A-Z]*\b")
     date_pattern = re.compile(r"\b\d{1,2}[/\-\]\d{1,2}[/\-\]\d{2,4}\b|\b\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov)[a-z]*\s+\d{2,4}\b", re.IGNORECASE)
     measurement_pattern = re.compile(r"\b\d+\.?\d*\s*(psi|bar|pa|kpa|mpa|°?[cfk]|rpm|hz|khz|mhz|mm|cm|m|km|in|ft)\b", re.IGNORECASE)
     regulation_pattern = re.compile(r"\b(Factory Act|OISD|PESO|ASME|OSHA|API\s*\d+)\b", re.IGNORECASE)
+    failure_pattern = re.compile(r"\b(leak(?:age)?|overheat(?:ing)?|vibration|bearing failure|seal failure|cavitation|corrosion|crack|trip|shutdown|fault)\b", re.IGNORECASE)
+    action_pattern = re.compile(r"\b(replace(?:d|ment)?|inspect(?:ed|ion)?|repair(?:ed)?|clean(?:ed|ing)?|calibrat(?:ed|ion)|lubricat(?:ed|ion)|tighten(?:ed)?|align(?:ed|ment)?)\b", re.IGNORECASE)
+    severity_pattern = re.compile(r"\b(low|medium|high|critical)\b", re.IGNORECASE)
+    location_pattern = re.compile(r"\b(?:Unit|Area|Boiler Area|Pump House|Compressor Bay|Plant|Line)[-\s]?\d*[A-Z]*\b", re.IGNORECASE)
 
     for chunk in chunks:
         text = chunk["text"]
-        
+
         # spaCy NER
         doc = nlp(text)
         for ent in doc.ents:
@@ -445,7 +768,7 @@ def extract_entities(chunks: List[Dict]) -> List[Dict]:
                 "page_no": chunk["page_no"],
                 "confidence": 0.95
             })
-            
+
         for match in date_pattern.finditer(text):
             entities.append({
                 "chunk_index": chunk["chunk_index"],
@@ -472,34 +795,70 @@ def extract_entities(chunks: List[Dict]) -> List[Dict]:
                 "page_no": chunk["page_no"],
                 "confidence": 0.9
             })
-            
+
+        for pattern, entity_type, confidence in [
+            (failure_pattern, "FAILURE_TYPE", 0.82),
+            (action_pattern, "MAINTENANCE_ACTION", 0.78),
+            (severity_pattern, "SEVERITY", 0.78),
+            (location_pattern, "LOCATION", 0.76),
+        ]:
+            for match in pattern.finditer(text):
+                entities.append({
+                    "chunk_index": chunk["chunk_index"],
+                    "entity_text": match.group(),
+                    "entity_type": entity_type,
+                    "page_no": chunk["page_no"],
+                    "confidence": confidence
+                })
+
     return entities
 
-async def save_ingestion_results(document_id: str, document_version_id: uuid.UUID, markdown_content: str, 
-                                 pages: List[tuple], chunks: List[Dict], entities: List[Dict], 
+def relationship_for_document_type(document_type: str) -> str:
+    normalized = (document_type or "").upper()
+    if "MANUAL" in normalized:
+        return "HAS_MANUAL"
+    if "SOP" in normalized or "SAFETY" in normalized:
+        return "APPLIES_TO"
+    if "INSPECTION" in normalized:
+        return "HAS_INSPECTION"
+    if "WORK" in normalized or "MAINTENANCE" in normalized:
+        return "HAS_WORK_ORDER"
+    if "COMPLIANCE" in normalized or "AUDIT" in normalized:
+        return "HAS_EVIDENCE"
+    return "MENTIONED_IN"
+
+def relationship_for_entity_type(entity_type: str) -> Optional[str]:
+    return {
+        "FAILURE_TYPE": "HAS_FAILURE",
+        "MAINTENANCE_ACTION": "HAS_RECOMMENDATION",
+        "REGULATION": "GOVERNED_BY",
+        "DATE": "INSPECTED_ON",
+        "LOCATION": "LOCATED_IN",
+        "SEVERITY": "HAS_STATUS",
+        "MEASUREMENT": "HAS_STATUS",
+    }.get(entity_type)
+
+async def save_ingestion_results(document_id: str, document_version_id: uuid.UUID, markdown_content: str,
+                                 pages: List[tuple], chunks: List[Dict], entities: List[Dict],
                                  embeddings: List[List[float]], tables: List[Dict]):
     """Saves output to PostgreSQL database schemas"""
     doc_uuid = uuid.UUID(document_id)
-    
+
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            # 1. Update document status & version markdown
+            # 1. Update version markdown. The final document status is owned by update_status.
             await conn.execute("""
-                UPDATE document.document_versions 
+                UPDATE document.document_versions
                 SET markdown_content = $1, ocr_confidence = 0.9, classification_confidence = 0.9, updated_at = NOW()
                 WHERE id = $2
             """, markdown_content, document_version_id)
-            
-            await conn.execute("""
-                UPDATE document.documents 
-                SET status = 'COMPLETED', updated_at = NOW() 
-                WHERE id = $1
-            """, doc_uuid)
-            
+
             # Fetch organization_id & plant_id
-            doc_info = await conn.fetchrow("SELECT organization_id, plant_id FROM document.documents WHERE id = $1", doc_uuid)
+            doc_info = await conn.fetchrow("SELECT organization_id, plant_id, title, document_type FROM document.documents WHERE id = $1", doc_uuid)
             org_id = doc_info["organization_id"]
             plant_id = doc_info["plant_id"]
+            document_title = doc_info.get("title") or str(doc_uuid)
+            document_type = (doc_info.get("document_type") or "document").upper()
 
             # 2. Store Pages
             await conn.execute("DELETE FROM ingestion.document_pages WHERE document_id = $1", doc_uuid)
@@ -523,23 +882,68 @@ async def save_ingestion_results(document_id: str, document_version_id: uuid.UUI
 
             # 4. Store Entities (Mapping tag values as normalized profiles)
             await conn.execute("DELETE FROM graph.entities WHERE document_id = $1", doc_uuid)
+
+            chunk_entities = {}
+            document_entity_id = uuid.uuid4()
+            await conn.execute("""
+                INSERT INTO graph.entities (id, organization_id, plant_id, document_id, chunk_id, entity_type, entity_value, normalized_value, confidence, page_no)
+                VALUES ($1, $2, $3, $4, NULL, 'DOCUMENT', $5, $6, 1.0, NULL)
+            """, document_entity_id, org_id, plant_id, doc_uuid, document_title, document_type)
+
             for ent in entities:
                 c_idx = ent["chunk_index"]
                 mapped_chunk_uuid = chunk_uuids[c_idx] if c_idx < len(chunk_uuids) else None
-                
+                entity_id = uuid.uuid4()
+
                 await conn.execute("""
-                    INSERT INTO graph.entities (organization_id, plant_id, document_id, chunk_id, entity_type, entity_value, normalized_value, confidence, page_no)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                """, org_id, plant_id, doc_uuid, mapped_chunk_uuid, ent["entity_type"], ent["entity_text"], ent["entity_text"].upper().strip(), ent["confidence"], ent["page_no"])
+                    INSERT INTO graph.entities (id, organization_id, plant_id, document_id, chunk_id, entity_type, entity_value, normalized_value, confidence, page_no)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                """, entity_id, org_id, plant_id, doc_uuid, mapped_chunk_uuid, ent["entity_type"], ent["entity_text"], ent["entity_text"].upper().strip(), ent["confidence"], ent["page_no"])
+
+                if mapped_chunk_uuid:
+                    if mapped_chunk_uuid not in chunk_entities:
+                        chunk_entities[mapped_chunk_uuid] = []
+                    chunk_entities[mapped_chunk_uuid].append({
+                        "id": entity_id,
+                        "type": ent["entity_type"],
+                        "text": ent["entity_text"],
+                    })
 
                 # If entity is an asset tag, automatically register/upsert in asset.assets
                 if ent["entity_type"] == "EQUIPMENT_TAG":
                     asset_tag = ent["entity_text"].upper().strip()
                     await conn.execute("""
-                        INSERT INTO asset.assets (organization_id, plant_id, asset_tag, asset_name, asset_type, location, criticality, risk_score)
-                        VALUES ($1, $2, $3, $4, $5, 'Unit-1', 'MEDIUM', 50)
+                        INSERT INTO asset.assets (organization_id, plant_id, asset_tag, asset_name, asset_type)
+                        VALUES ($1, $2, $3, $4, $5)
                         ON CONFLICT (plant_id, asset_tag) DO NOTHING
                     """, org_id, plant_id, asset_tag, f"Equipment {asset_tag}", "Asset")
+
+            # 4.1 Store semantic and co-occurrence relationships for entities in the same chunk
+            await conn.execute("DELETE FROM graph.relationships WHERE evidence_document_id = $1", doc_uuid)
+            for chunk_uuid, ents in chunk_entities.items():
+                asset_entities = [ent for ent in ents if ent["type"] == "EQUIPMENT_TAG"]
+                for asset_ent in asset_entities:
+                    await conn.execute("""
+                        INSERT INTO graph.relationships (organization_id, source_entity_id, target_entity_id, relationship_type, confidence, evidence_document_id, evidence_chunk_id)
+                        VALUES ($1, $2, $3, $4, 0.9, $5, $6)
+                    """, org_id, asset_ent["id"], document_entity_id, relationship_for_document_type(document_type), doc_uuid, chunk_uuid)
+
+                    for target_ent in ents:
+                        if target_ent["id"] == asset_ent["id"]:
+                            continue
+                        relationship_type = relationship_for_entity_type(target_ent["type"])
+                        if relationship_type:
+                            await conn.execute("""
+                                INSERT INTO graph.relationships (organization_id, source_entity_id, target_entity_id, relationship_type, confidence, evidence_document_id, evidence_chunk_id)
+                                VALUES ($1, $2, $3, $4, 0.82, $5, $6)
+                            """, org_id, asset_ent["id"], target_ent["id"], relationship_type, doc_uuid, chunk_uuid)
+
+                for i in range(len(ents)):
+                    for j in range(i + 1, len(ents)):
+                        await conn.execute("""
+                            INSERT INTO graph.relationships (organization_id, source_entity_id, target_entity_id, relationship_type, confidence, evidence_document_id, evidence_chunk_id)
+                            VALUES ($1, $2, $3, 'CO_OCCURS_WITH', 0.8, $4, $5)
+                        """, org_id, ents[i]["id"], ents[j]["id"], doc_uuid, chunk_uuid)
 
             # 5. Store Tables as Entities
             for table in tables:
@@ -551,82 +955,147 @@ async def save_ingestion_results(document_id: str, document_version_id: uuid.UUI
 
 # --- COGNITIVE SERVICES (RAG & COPILOT) ---
 
+UNSAFE_QUERY_PATTERN = re.compile(
+    r"\b(bypass|disable|override|ignore safety|hotwire|remove guard|defeat interlock|without permit|legal guarantee|certify compliance)\b",
+    re.IGNORECASE,
+)
+
+def normalize_filter_values(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in re.split(r"[,;]", value) if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+def query_looks_unsafe(question: str) -> bool:
+    return bool(UNSAFE_QUERY_PATTERN.search(question or ""))
+
+def answer_has_citation(answer: str, citation_count: int) -> bool:
+    if citation_count <= 0:
+        return False
+    cited_indexes = {int(match) for match in re.findall(r"\[(\d+)\]", answer or "")}
+    return any(1 <= index <= citation_count for index in cited_indexes)
+
 @app.post("/query")
 async def rag_query(request: CopilotQueryRequest):
     """Executes hybrid pgvector search and synthesizes answers with citations"""
     if not db_pool:
-        raise HTTPException(status_code=500, detail="Database connection unavailable")
+        return graceful_query_response(request.question, "Database connection unavailable")
+
+    if query_looks_unsafe(request.question):
+        return {
+            "answer": "I cannot provide unsafe operational bypasses or legal/compliance certification. Review the authorized SOP and have a qualified supervisor approve any critical action.",
+            "confidence": 0.0,
+            "citations": [],
+            "relatedAssets": extract_asset_tags(request.question),
+            "missingInfo": ["Query requested unsafe, unsupported, or certification-like guidance."],
+            "fallback": True
+        }
 
     try:
+        plant_uuid = optional_uuid(request.plantId)
+        if not plant_uuid:
+            return graceful_query_response(request.question, "Invalid or missing plantId")
+
         # Generate 1536-dimensional query embedding
         query_embedding = await get_gemini_embedding_1536(request.question)
-        
+
         # Parse filters
-        asset_filter = request.filters.get("assetTag") if request.filters else None
-        
+        filters = request.filters or {}
+        asset_filter = filters.get("assetTag") if isinstance(filters, dict) else None
+        document_type_filters = normalize_filter_values(filters.get("documentTypes") or filters.get("documentType")) if isinstance(filters, dict) else []
+        date_from = filters.get("dateFrom") if isinstance(filters, dict) else None
+        date_to = filters.get("dateTo") if isinstance(filters, dict) else None
+
         # 1. Retrieve Candidate Chunks (pgvector Cosine Distance <->)
         async with db_pool.acquire() as conn:
-            org_id = await conn.fetchval(
+            org_row = await conn.fetchrow(
                 "SELECT organization_id FROM identity.plants WHERE id = $1",
-                uuid.UUID(request.plantId)
+                plant_uuid
             )
-            if not org_id:
-                org_row = await conn.fetchrow(
-                    "SELECT organization_id FROM identity.plants WHERE id = $1",
-                    uuid.UUID(request.plantId)
-                )
-                if org_row:
-                    org_id = org_row["organization_id"]
-            if not org_id:
-                raise HTTPException(status_code=404, detail="Plant not found")
+            if not org_row:
+                return graceful_query_response(request.question, "Plant not found")
+
+            org_id = optional_uuid(request.organizationId) or org_row["organization_id"]
+            if optional_uuid(request.organizationId) and org_row["organization_id"] != org_id:
+                return graceful_query_response(request.question, "Plant is outside the requested organization")
+
+            current_user_role = await resolve_request_role(conn, request, plant_uuid, org_id)
+            access_columns = await get_document_access_columns(conn)
+            access_select = document_access_select(access_columns)
 
             # We filter by plant_id of the document
-            chunks_rows = await conn.fetch("""
+            chunks_rows = await conn.fetch(f"""
                 SELECT c.id, c.document_id, c.page_no, c.chunk_text, d.title,
+                       {access_select},
                        (c.embedding <=> $1) as distance
                 FROM ingestion.document_chunks c
                 JOIN document.documents d ON c.document_id = d.id
                 WHERE d.plant_id = $2
+                  AND d.organization_id = $3
+                  AND d.status <> 'ARCHIVED'
+                  AND c.document_version_id = d.current_version_id
+                  AND (cardinality($4::text[]) = 0 OR d.document_type = ANY($4::text[]))
+                  AND ($5::timestamptz IS NULL OR d.created_at >= $5::timestamptz)
+                  AND ($6::timestamptz IS NULL OR d.created_at <= $6::timestamptz)
                 ORDER BY distance ASC
                 LIMIT 6
-            """, query_embedding, uuid.UUID(request.plantId))
-            
+            """, query_embedding, plant_uuid, org_id, document_type_filters, date_from, date_to)
+
             # 2. Keyword/Exact Tag search fallback (if tag is queried or contained)
             keyword_chunks = []
             extracted_tags = re.findall(r"\b[A-Z]+[-\s]*\d+[A-Z]*\b", request.question.upper())
             if asset_filter:
                 extracted_tags.append(asset_filter.upper())
-                
+
             if extracted_tags:
                 tag_queries = [f"%{tag}%" for tag in extracted_tags]
                 for t_q in tag_queries:
-                    k_rows = await conn.fetch("""
-                        SELECT c.id, c.document_id, c.page_no, c.chunk_text, d.title, 0.0 as distance
+                    k_rows = await conn.fetch(f"""
+                        SELECT c.id, c.document_id, c.page_no, c.chunk_text, d.title,
+                               {access_select},
+                               0.0 as distance
                         FROM ingestion.document_chunks c
                         JOIN document.documents d ON c.document_id = d.id
-                        WHERE d.plant_id = $1 AND (c.chunk_text ILIKE $2 OR d.title ILIKE $2)
+                        WHERE d.plant_id = $1
+                          AND d.organization_id = $3
+                          AND d.status <> 'ARCHIVED'
+                          AND c.document_version_id = d.current_version_id
+                          AND (cardinality($4::text[]) = 0 OR d.document_type = ANY($4::text[]))
+                          AND ($5::timestamptz IS NULL OR d.created_at >= $5::timestamptz)
+                          AND ($6::timestamptz IS NULL OR d.created_at <= $6::timestamptz)
+                          AND (c.chunk_text ILIKE $2 OR d.title ILIKE $2)
                         LIMIT 3
-                    """, uuid.UUID(request.plantId), t_q)
+                    """, plant_uuid, t_q, org_id, document_type_filters, date_from, date_to)
                     keyword_chunks.extend(k_rows)
-            
+
             # Combine searches
             seen = set()
             combined_results = []
+            restricted_matches = 0
             for r in (keyword_chunks + list(chunks_rows)):
                 if r["id"] not in seen:
                     seen.add(r["id"])
+                    if not document_row_access_allowed(r, current_user_role):
+                        restricted_matches += 1
+                        continue
                     combined_results.append(r)
-            
+
             # Sort combined results (exact keyword hits are prioritised)
             combined_results = combined_results[:6]
-            
+
             if not combined_results:
+                missing_info = []
+                if restricted_matches:
+                    missing_info.append("Some matching sources are restricted for the current user role.")
                 return {
-                    "answer": "No relevant documentation or evidence was found for the query in this plant's database.",
+                    "answer": "No accessible documentation or evidence was found for the query in this plant's database.",
                     "confidence": 0.0,
                     "citations": [],
                     "relatedAssets": [],
-                    "missingInfo": []
+                    "missingInfo": missing_info
                 }
 
             # 3. Construct prompt
@@ -640,7 +1109,7 @@ async def rag_query(request: CopilotQueryRequest):
                     "page": r["page_no"],
                     "snippet": r["chunk_text"][:200] + "..."
                 })
-                
+
             context_str = "\n\n".join(context_blocks)
             prompt = f"""
 You are an expert industrial engineering AI. Answer the following technical question based ONLY on the provided document excerpts.
@@ -658,17 +1127,17 @@ CONFIDENCE: <estimated floating point score between 0.0 and 1.0>
 MISSING_INFO: <comma separated details of any missing info or data gaps, or None>
 """
             llm_output = await generate_text_llm(prompt)
-            
+
             # Parse output
             answer = "Unable to process query."
             confidence = 0.5
             missing_info = []
-            
+
             try:
                 ans_match = re.search(r"ANSWER:\s*(.*?)(?=CONFIDENCE:|$)", llm_output, re.DOTALL)
                 conf_match = re.search(r"CONFIDENCE:\s*([\d\.]+)", llm_output)
                 miss_match = re.search(r"MISSING_INFO:\s*(.*)", llm_output)
-                
+
                 if ans_match:
                     answer = ans_match.group(1).strip()
                 if conf_match:
@@ -680,13 +1149,18 @@ MISSING_INFO: <comma separated details of any missing info or data gaps, or None
             except Exception as parse_e:
                 logger.error(f"Error parsing LLM output: {parse_e}. Raw output: {llm_output}")
                 answer = llm_output
-            
+
+            if not answer_has_citation(answer, len(citations)):
+                missing_info.append("The generated answer did not include valid source citations, so it was not returned as a factual answer.")
+                answer = "Not enough cited evidence is available to answer safely. Please review the source documents or refine the question."
+                confidence = min(confidence, 0.2)
+
             # Save query log to DB
             query_uuid = uuid.uuid4()
             await conn.execute("""
-                INSERT INTO rag.queries (id, organization_id, plant_id, query_text, answer_text, confidence)
-                VALUES ($1, $2, $3, $4, $5, $6)
-            """, query_uuid, org_id, uuid.UUID(request.plantId), request.question, answer, confidence)
+                INSERT INTO rag.queries (id, organization_id, plant_id, user_id, query_text, answer_text, confidence)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """, query_uuid, org_id, plant_uuid, optional_uuid(request.userId), request.question, answer, confidence)
 
             for citation in citations:
                 await conn.execute("""
@@ -704,7 +1178,7 @@ MISSING_INFO: <comma separated details of any missing info or data gaps, or None
 
     except Exception as e:
         logger.error(f"RAG query execution failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        return graceful_query_response(request.question, str(e))
 
 # --- ROOT CAUSE ANALYSIS (RCA) SERVICE ---
 
@@ -712,22 +1186,34 @@ MISSING_INFO: <comma separated details of any missing info or data gaps, or None
 async def generate_rca(request: RCAGenerateRequest):
     """Retrieves maintenance logs and work orders for an asset tag and drafts an LLM-powered RCA report"""
     if not db_pool:
-        raise HTTPException(status_code=500, detail="Database connection unavailable")
-        
+        return graceful_rca_response(request.assetTag, "Database connection unavailable")
+
     asset_tag = request.assetTag.upper().strip()
+    def row_value(row, key, default=None):
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return default
+
     try:
+        plant_uuid = optional_uuid(request.plantId)
+        org_uuid = optional_uuid(request.organizationId)
         async with db_pool.acquire() as conn:
             # Query all entities matching this asset tag to pull corresponding document contents
             rows = await conn.fetch("""
-                SELECT DISTINCT c.chunk_text, d.title, d.created_at
+                SELECT DISTINCT c.chunk_text, d.title, d.created_at, d.id as document_id
                 FROM graph.entities e
                 JOIN ingestion.document_chunks c ON e.chunk_id = c.id
                 JOIN document.documents d ON c.document_id = d.id
                 WHERE e.normalized_value = $1
+                  AND d.status <> 'ARCHIVED'
+                  AND c.document_version_id = d.current_version_id
+                  AND ($2::uuid IS NULL OR d.plant_id = $2)
+                  AND ($3::uuid IS NULL OR d.organization_id = $3)
                 ORDER BY d.created_at DESC
                 LIMIT 10
-            """, asset_tag)
-            
+            """, asset_tag, plant_uuid, org_uuid)
+
             if not rows:
                 return {
                     "summary": f"No historical maintenance records or manuals found for asset tag {asset_tag}.",
@@ -736,11 +1222,11 @@ async def generate_rca(request: RCAGenerateRequest):
                     "confidence": 0.0,
                     "citations": []
                 }
-                
+
             history_blocks = []
             for r in rows:
                 history_blocks.append(f"Date: {r['created_at'].strftime('%Y-%m-%d')} | Doc: {r['title']}\n{r['chunk_text']}")
-            
+
             history_str = "\n\n".join(history_blocks)
             prompt = f"""
 You are an industrial reliability expert. Construct a Root Cause Analysis (RCA) report for the asset {asset_tag}.
@@ -763,19 +1249,19 @@ RECOMMENDATIONS: <comma separated actions>
 CONFIDENCE: <decimal value>
 """
             llm_output = await generate_text_llm(prompt)
-            
+
             # Simple parses
             summary = "Failed to draft RCA summary."
             probable_causes = []
             recommendations = []
             confidence = 0.5
-            
+
             try:
                 sum_match = re.search(r"SUMMARY:\s*(.*?)(?=PROBABLE_CAUSES:|$)", llm_output, re.DOTALL)
                 causes_match = re.search(r"PROBABLE_CAUSES:\s*(.*?)(?=RECOMMENDATIONS:|$)", llm_output, re.DOTALL)
                 recs_match = re.search(r"RECOMMENDATIONS:\s*(.*?)(?=CONFIDENCE:|$)", llm_output, re.DOTALL)
                 conf_match = re.search(r"CONFIDENCE:\s*([\d\.]+)", llm_output)
-                
+
                 if sum_match:
                     summary = sum_match.group(1).strip()
                 if causes_match:
@@ -787,26 +1273,42 @@ CONFIDENCE: <decimal value>
             except Exception as e:
                 logger.error(f"Error parsing RCA output: {e}. Raw text: {llm_output}")
                 summary = llm_output
-                
+
             # Log to rca.reports table
-            asset_row = await conn.fetchrow("SELECT id, organization_id FROM asset.assets WHERE asset_tag = $1 LIMIT 1", asset_tag)
+            asset_row = await conn.fetchrow("""
+                SELECT id, organization_id, plant_id
+                FROM asset.assets
+                WHERE asset_tag = $1
+                  AND ($2::uuid IS NULL OR plant_id = $2)
+                  AND ($3::uuid IS NULL OR organization_id = $3)
+                LIMIT 1
+            """, asset_tag, plant_uuid, org_uuid)
             if asset_row:
+                asset_plant_id = row_value(asset_row, "plant_id", plant_uuid)
                 await conn.execute("""
-                    INSERT INTO rca.reports (organization_id, asset_id, failure_summary, probable_causes, recommendations, confidence)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                """, asset_row["organization_id"], asset_row["id"], summary, json.dumps(probable_causes), json.dumps(recommendations), confidence)
-                
+                    INSERT INTO rca.reports (organization_id, plant_id, asset_id, failure_summary, probable_causes, recommendations, confidence, created_by)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """, asset_row["organization_id"], asset_plant_id, asset_row["id"], summary, json.dumps(probable_causes), json.dumps(recommendations), confidence, optional_uuid(request.userId))
+
+            citations = []
+            for r in rows:
+                document_id = row_value(r, "document_id")
+                citation = {"documentTitle": row_value(r, "title", "Untitled document")}
+                if document_id is not None:
+                    citation["documentId"] = str(document_id)
+                citations.append(citation)
+
             return {
                 "summary": summary,
                 "probableCauses": probable_causes,
                 "recommendations": recommendations,
                 "confidence": confidence,
-                "citations": [{"documentTitle": r["title"]} for r in rows]
+                "citations": citations
             }
-            
+
     except Exception as e:
         logger.error(f"RCA generation failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        return graceful_rca_response(request.assetTag, str(e))
 
 # --- COMPLIANCE gap CHECKER ---
 
@@ -815,16 +1317,16 @@ async def audit_compliance(plantId: str):
     """Scans all assets for this plant and flags compliance gaps (missing checklists, overdue inspections)"""
     if not db_pool:
         raise HTTPException(status_code=500, detail="Database connection unavailable")
-        
+
     try:
         plant_uuid = uuid.UUID(plantId)
         async with db_pool.acquire() as conn:
             # 1. Fetch all assets for this plant
             assets = await conn.fetch("SELECT id, asset_tag, asset_name FROM asset.assets WHERE plant_id = $1", plant_uuid)
-            
+
             # Fetch all requirements
             requirements = await conn.fetch("SELECT id, title, requirement_type, frequency FROM compliance.requirements")
-            
+
             if not requirements:
                 # Insert default requirements if none exist
                 default_reqs = [
@@ -835,7 +1337,7 @@ async def audit_compliance(plantId: str):
                 # Fetch org ID
                 org_row = await conn.fetchrow("SELECT organization_id FROM identity.plants WHERE id = $1", plant_uuid)
                 org_id = org_row["organization_id"] if org_row else uuid.uuid4()
-                
+
                 for title, r_type, freq in default_reqs:
                     await conn.execute("""
                         INSERT INTO compliance.requirements (organization_id, plant_id, title, requirement_type, frequency)
@@ -849,14 +1351,14 @@ async def audit_compliance(plantId: str):
             for asset in assets:
                 asset_id = asset["id"]
                 tag = asset["asset_tag"]
-                
+
                 # Check for "Inspection" or "Report" or "Certificate" documents mentioning this asset tag
                 has_inspection = await conn.fetchval("""
                     SELECT COUNT(*) FROM graph.entities e
                     JOIN document.documents d ON e.document_id = d.id
                     WHERE e.normalized_value = $1 AND (d.document_type ILIKE '%inspection%' OR d.title ILIKE '%inspection%' OR d.title ILIKE '%report%')
                 """, tag)
-                
+
                 if has_inspection == 0:
                     # Missing all inspections
                     for req in requirements:
@@ -867,7 +1369,7 @@ async def audit_compliance(plantId: str):
                             VALUES ((SELECT organization_id FROM asset.assets WHERE id = $1), $2, $1, $3, 'MISSING_EVIDENCE', $4, 'HIGH', 'OPEN')
                             ON CONFLICT DO NOTHING
                         """, asset_id, plant_uuid, req["id"], description)
-                        
+
                         gaps.append({
                             "assetTag": tag,
                             "gapType": "MISSING_EVIDENCE",
@@ -898,9 +1400,9 @@ async def audit_compliance(plantId: str):
                             "status": "OPEN",
                             "standard": "Regulatory Certificate"
                         })
-            
+
             return gaps
-            
+
     except Exception as e:
         logger.error(f"Compliance audit failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

@@ -2,6 +2,8 @@
 
 ## Local MVP
 
+Compose defaults are self-contained for local infrastructure. Export `GOOGLE_API_KEY` or `GROQ_API_KEY` before `make services-up` if you want live AI calls; otherwise the AI service returns deterministic fallback text where provider calls are unavailable.
+
 Start only shared dependencies:
 
 ```bash
@@ -36,6 +38,14 @@ Useful local URLs:
 - MinIO console: `http://localhost:9001`
 - Web app: `http://localhost:3000`
 
+After the stack is up, run a live smoke check:
+
+```bash
+make smoke
+```
+
+The smoke check calls API and AI `/health`, then verifies `/api/me` with `PLANTBRAIN_API_TOKEN` or the local `dev-token`. Set `PLANTBRAIN_SKIP_AUTH_SMOKE=1` to skip the auth probe for non-dev environments, or `PLANTBRAIN_SMOKE_LIVE_AI=1` to run the live AI endpoint checks from `tests/integration_test.py`.
+
 ## Runtime Strategy
 
 The MVP deploys as:
@@ -58,6 +68,8 @@ make compose-config
 ```
 
 CI also runs `docker compose config` to catch invalid YAML or service references.
+
+Generated CSV, PDF, and DOCX reports are written under the API upload volume at `/app/uploads/reports` and are downloaded through `GET /api/reports/{id}/download`.
 
 ## Kubernetes
 

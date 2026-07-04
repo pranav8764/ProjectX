@@ -1,11 +1,11 @@
 x-service-env: &service-env
-  DATABASE_URL: postgresql://plantbrain:plantbrain@postgres:5432/plantbrain
+  DATABASE_URL: postgresql://${POSTGRES_USER:?Set POSTGRES_USER}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?Set POSTGRES_DB}
   REDIS_URL: redis://redis:6379
   STORAGE_PROVIDER: minio
   S3_ENDPOINT: http://minio:9000
-  S3_ACCESS_KEY_ID: plantbrain
-  S3_SECRET_ACCESS_KEY: plantbrain123
-  STORAGE_BUCKET: plantbrain-documents
+  S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+  S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+  STORAGE_BUCKET: ${STORAGE_BUCKET:?Set STORAGE_BUCKET}
   AI_SERVICE_URL: http://ai:8000
   LOG_LEVEL: info
   APP_ENV: development
@@ -16,9 +16,9 @@ services:
     image: pgvector/pgvector:pg16
     container_name: plantbrain-postgres
     environment:
-      POSTGRES_DB: plantbrain
-      POSTGRES_USER: plantbrain
-      POSTGRES_PASSWORD: plantbrain
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -36,8 +36,8 @@ services:
     container_name: plantbrain-minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: plantbrain
-      MINIO_ROOT_PASSWORD: plantbrain123
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -68,8 +68,10 @@ services:
     environment:
       <<: *service-env
       PORT: 8000
-    ports:
-      - "8000:8000"
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    expose:
+      - "8000"
     volumes:
       - uploads-data:/app/uploads
     depends_on:

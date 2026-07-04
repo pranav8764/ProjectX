@@ -39,7 +39,7 @@ The original product plan used names such as Document Service, RAG Service, Grap
 | Graph | `services/ai` | Extracted entities, relationships, deduplication, graph expansion |
 | RCA | `services/api`, `services/ai` | Failure context, probable causes, recommendations, cited RCA records |
 | Compliance | `services/api`, `services/ai` | Requirements, evidence matching, gap detection, dashboard reads |
-| Reports | `services/api` | CSV export jobs for the MVP; PDF/DOCX can be added later |
+| Reports | `services/api` | Synchronous MVP report jobs with CSV, PDF, and DOCX downloads |
 | Audit and notifications | `services/api` now, future split if needed | Audit events and processing/compliance alerts |
 
 ## Storage

@@ -16,6 +16,7 @@ dist/
 build/
 coverage/
 .turbo/
+.gocache/
 
 # Logs
 *.log
@@ -38,4 +39,3 @@ data/uploads/*
 postgres-data/
 redis-data/
 minio-data/
-

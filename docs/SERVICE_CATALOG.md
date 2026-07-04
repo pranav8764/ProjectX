@@ -29,4 +29,4 @@
 - Redis is available for future queues/events.
 - MinIO stores original uploads.
 - A shared Docker volume mounted at `/app/uploads` lets `services/api` save files and `services/ai` process them during the MVP.
-- Legacy OpenAPI sketches under `contracts/openapi/*-service.yaml` document possible future domain splits only; they are not deployable service definitions.
+- Runtime OpenAPI contracts are limited to `contracts/openapi/api.yaml` and `contracts/openapi/ai.yaml`.

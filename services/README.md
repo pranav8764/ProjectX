@@ -11,4 +11,4 @@ PlantBrainAI currently uses a consolidated MVP backend. External clients call th
 
 Do not add empty folders for individual domains. Document, asset, graph, RAG, RCA, compliance, report, audit, and notification are logical modules inside the consolidated runtime until the MVP needs a real service split.
 
-See `docs/SERVICE_CATALOG.md` for ownership details and `contracts/openapi/README.md` for current versus legacy contracts.
+See `docs/SERVICE_CATALOG.md` for ownership details and `contracts/openapi/README.md` for the current runtime contracts.

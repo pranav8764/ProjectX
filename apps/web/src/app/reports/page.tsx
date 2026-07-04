@@ -3,10 +3,11 @@
 import React, { useEffect, useState } from 'react';
 import NavigationShell from '../../components/NavigationShell';
 import { useData } from '../../context/DataContext';
-import { apiFetch } from '../../lib/api';
+import { apiFetch, getStoredSession, PlantBrainSession } from '../../lib/api';
+import { canRunAction, getDeniedMessage } from '../../lib/permissions';
 import { getQueryAnswerHistory, QueryAnswerRecord } from '../../lib/query-history';
 import { Asset, ComplianceGap, Document } from '../../lib/mockData';
-import { Activity, CheckCircle2, Clock, FileDown, FileSpreadsheet, FileText, MessageSquareText, ShieldAlert } from 'lucide-react';
+import { Activity, CheckCircle2, Clock, FileDown, FileSpreadsheet, FileText, MessageSquareText, ShieldAlert, AlertTriangle } from 'lucide-react';
 
 type ReportType = 'asset_summary' | 'compliance_gap' | 'document_inventory' | 'rca_report' | 'query_answers';
 type ReportFormat = 'csv' | 'pdf' | 'docx';
@@ -33,11 +34,17 @@ export default function ReportsPage() {
   const [queryHistory, setQueryHistory] = useState<QueryAnswerRecord[]>([]);
   const [reportFormat, setReportFormat] = useState<ReportFormat>('csv');
 
+  const [session, setSession] = useState<PlantBrainSession | null>(null);
+
   useEffect(() => {
+    setSession(getStoredSession());
     setQueryHistory(getQueryAnswerHistory());
   }, []);
 
+  const canExport = canRunAction(session?.role, 'export_reports');
+
   const generateReport = async (type: ReportType) => {
+    if (!canExport) return;
     setBusyType(type);
     let serverDownloadReady = false;
 
@@ -52,7 +59,7 @@ export default function ReportsPage() {
         const job: ReportJobResponse = await res.json();
         setQueuedReport(job.id || null);
         if (job.downloadUrl) {
-          serverDownloadReady = await downloadServerReport(job.downloadUrl, type);
+          serverDownloadReady = await downloadServerReport(job.downloadUrl, type, reportFormat);
         }
       }
     } catch {
@@ -68,6 +75,13 @@ export default function ReportsPage() {
   return (
     <NavigationShell>
       <div className="space-y-6">
+        {!canExport && (
+          <div className="p-4 bg-cyber-amber/5 border border-cyber-amber/20 text-amber-200 rounded-xl text-sm flex gap-2">
+            <AlertTriangle className="w-5 h-5 shrink-0 text-cyber-amber" />
+            <span>{getDeniedMessage(session?.role, 'export_reports')}</span>
+          </div>
+        )}
+
         <div className="glass-panel p-4 rounded-2xl border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
             <h3 className="text-sm font-bold text-white tracking-wide">Export Format</h3>
@@ -104,7 +118,7 @@ export default function ReportsPage() {
               </div>
               <button
                 onClick={() => generateReport(card.type)}
-                disabled={busyType === card.type}
+                disabled={busyType === card.type || !canExport}
                 className="w-full py-2.5 bg-cyber-emerald hover:bg-emerald-600 disabled:opacity-60 text-slate-950 font-bold rounded-xl text-xs transition-all flex items-center justify-center gap-2"
               >
                 <FileDown className="w-4 h-4" />
@@ -169,13 +183,13 @@ function getReportCount(type: ReportType, assets: Asset[], documents: Document[]
   return gaps.length;
 }
 
-async function downloadServerReport(downloadUrl: string, type: ReportType) {
+async function downloadServerReport(downloadUrl: string, type: ReportType, format: ReportFormat) {
   const res = await apiFetch(downloadUrl);
   if (!res.ok) return false;
 
   const blob = await res.blob();
   const disposition = res.headers.get('Content-Disposition');
-  const filename = getFilename(disposition) || `${type}_${new Date().toISOString().slice(0, 10)}.csv`;
+  const filename = getFilename(disposition) || `${type}_${new Date().toISOString().slice(0, 10)}.${format}`;
   triggerDownload(blob, filename);
   return true;
 }

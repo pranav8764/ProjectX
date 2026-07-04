@@ -3,9 +3,10 @@
 import React, { Suspense, useState, useEffect, useRef } from 'react';
 import NavigationShell from '../../components/NavigationShell';
 import { queryCopilot, CopilotResponse } from '../../lib/mockData';
-import { apiFetch } from '../../lib/api';
+import { apiFetch, getStoredSession, PlantBrainSession, readApiError } from '../../lib/api';
 import { recordQueryAnswer } from '../../lib/query-history';
 import { useData } from '../../context/DataContext';
+import { normalizeRole } from '../../lib/permissions';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { 
   Send, 
@@ -52,16 +53,28 @@ function CopilotPageContent() {
   const [selectedDocTypes, setSelectedDocTypes] = useState<string[]>(['Maintenance Work Order', 'Inspection Report', 'OEM Manual', 'SOP']);
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  const [session, setSession] = useState<PlantBrainSession | null>(null);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const availableDocTypes = Array.from(new Set(documents.map(doc => doc.documentType))).sort();
+  const isTechnician = normalizeRole(session?.role) === 'technician';
 
   // Suggested Prompts
-  const suggestions = [
-    { label: "P-101 Failure Reason", query: "Why is Pump P-101 repeatedly failing?" },
-    { label: "Boiler B-12 SOP", query: "Show SOP for boiler startup." },
-    { label: "C-204 Overheating", query: "Why did Compressor C-204 fail on Feb 18?" }
-  ];
+  const suggestions = isTechnician
+    ? [
+        { label: 'B-12 Startup SOP', query: 'Show the safe startup procedure for boiler B-12 with citations.' },
+        { label: 'Hot Work Safety', query: 'What safety precautions apply before hot work?' },
+        { label: 'P-101 Field Check', query: 'What should I check before inspecting Pump P-101 leakage?' },
+      ]
+    : [
+        { label: "P-101 Failure Reason", query: "Why is Pump P-101 repeatedly failing?" },
+        { label: "Boiler B-12 SOP", query: "Show SOP for boiler startup." },
+        { label: "C-204 Overheating", query: "Why did Compressor C-204 fail on Feb 18?" }
+      ];
+
+  useEffect(() => {
+    setSession(getStoredSession());
+  }, []);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -124,6 +137,28 @@ function CopilotPageContent() {
         body: JSON.stringify(payload)
       });
 
+      if (res.status === 403) {
+        const message = await readApiError(res, 'Your role cannot query one or more restricted sources.');
+        setMessages(prev => prev.map(m => {
+          if (m.id === assistantMessageId) {
+            return {
+              ...m,
+              text: message,
+              loading: false,
+              response: {
+                answer: message,
+                confidence: 0,
+                citations: [],
+                relatedAssets: [],
+                missingInfo: ['Ask an admin or compliance officer for access to the restricted evidence.'],
+              },
+            };
+          }
+          return m;
+        }));
+        return;
+      }
+
       if (!res.ok) throw new Error('API server unreachable');
 
       const data = normalizeCopilotResponse(await res.json());
@@ -167,7 +202,7 @@ function CopilotPageContent() {
 
   return (
     <NavigationShell>
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 h-[calc(100vh-10rem)] max-h-[900px] overflow-hidden">
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 min-h-[calc(100svh-9rem)] xl:h-[calc(100vh-10rem)] xl:max-h-[900px] xl:overflow-hidden">
         
         {/* Left/Middle Column: Chat Panel */}
         <div className="xl:col-span-2 flex flex-col justify-between glass-panel rounded-2xl border-slate-800/80 overflow-hidden relative">
@@ -336,6 +371,25 @@ function CopilotPageContent() {
             </div>
           )}
 
+          {isTechnician && messages.length === 1 && (
+            <div className="sm:hidden px-4 py-3 border-t border-slate-800/40 grid grid-cols-1 gap-2 bg-[#090d1f]/70">
+              {assets.slice(0, 3).map(asset => (
+                <button
+                  key={asset.id}
+                  type="button"
+                  onClick={() => {
+                    setAssetFilter(asset.assetTag);
+                    handleSend(`Show the current SOP, hazards, and missing evidence for ${asset.assetTag}.`);
+                  }}
+                  className="px-3 py-3 rounded-xl border border-slate-800 bg-slate-900/70 text-left"
+                >
+                  <span className="text-xs font-bold text-slate-200 block">{asset.assetTag} - {asset.assetName}</span>
+                  <span className="text-[10px] text-slate-500 font-mono">{asset.location}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
           {/* Form Input */}
           <form 
             onSubmit={(e) => { e.preventDefault(); handleSend(input); }}
@@ -345,11 +399,12 @@ function CopilotPageContent() {
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask a question about plant manuals, failures, or codes..."
-              className="flex-1 px-4 py-3 rounded-xl glass-input text-xs font-medium"
+              placeholder={isTechnician ? 'Ask for an SOP, hazard, or asset check...' : 'Ask a question about plant manuals, failures, or codes...'}
+              className="flex-1 px-4 py-3 sm:py-3.5 rounded-xl glass-input text-sm sm:text-xs font-medium"
             />
             <button
               type="submit"
+              aria-label="Send query"
               className="p-3 bg-cyber-emerald hover:bg-emerald-600 active:bg-emerald-700 text-slate-950 font-bold rounded-xl transition-all hover:shadow-[0_0_15px_rgba(16,185,129,0.2)]"
             >
               <Send className="w-4 h-4" />

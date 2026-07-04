@@ -1,4 +1,4 @@
-.PHONY: help infra-up infra-down services-up services-down compose-config ps logs db-seed
+.PHONY: help infra-up infra-down services-up services-down compose-config ps logs db-seed smoke test test-api test-ai test-web
 
 help:
 	@echo "PlantBrainAI developer commands"
@@ -8,6 +8,11 @@ help:
 	@echo "  make services-down  Stop the local compose stack"
 	@echo "  make db-seed        Run database seeds (demo dataset)"
 	@echo "  make compose-config Validate docker-compose.yml"
+	@echo "  make smoke          Check live API/AI health and API auth context"
+	@echo "  make test           Run API, AI, and web validation checks"
+	@echo "  make test-api       Run Go API tests"
+	@echo "  make test-ai        Run AI integration tests in mock mode by default"
+	@echo "  make test-web       Build the Next.js web app"
 	@echo "  make ps             Show compose services"
 	@echo "  make logs           Follow compose logs"
 
@@ -29,8 +34,23 @@ services-down:
 compose-config:
 	docker compose config
 
+smoke:
+	./scripts/smoke.sh
+
 ps:
 	docker compose ps
 
 logs:
 	docker compose logs -f
+
+test: test-api test-ai test-web
+
+test-api:
+	go -C services/api test ./...
+
+test-ai:
+	python3 tests/integration_test.py
+
+test-web:
+	npm --prefix apps/web ci
+	npm --prefix apps/web run build

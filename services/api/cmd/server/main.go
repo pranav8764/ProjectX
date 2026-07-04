@@ -4,7 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -69,6 +72,8 @@ type Document struct {
 	ID           string    `json:"id"`
 	Title        string    `json:"title"`
 	DocumentType string    `json:"documentType"`
+	AccessLevel  string    `json:"accessLevel"`
+	Sensitivity  string    `json:"sensitivity"`
 	Status       string    `json:"status"`
 	CreatedAt    time.Time `json:"createdAt"`
 }
@@ -79,7 +84,9 @@ type QueryRequest struct {
 	PlantID        string                 `json:"plantId"`
 	UserID         string                 `json:"userId,omitempty"`
 	OrganizationID string                 `json:"organizationId,omitempty"`
+	UserRole       string                 `json:"userRole,omitempty"`
 	Filters        map[string]interface{} `json:"filters"`
+	AccessContext  map[string]interface{} `json:"accessContext,omitempty"`
 }
 
 // RCAGenerateReq represents the body of /api/rca/generate
@@ -88,6 +95,7 @@ type RCAGenerateReq struct {
 	FailureDescription string `json:"failureDescription" binding:"required"`
 	PlantID            string `json:"plantId,omitempty"`
 	UserID             string `json:"userId,omitempty"`
+	OrganizationID     string `json:"organizationId,omitempty"`
 }
 
 // ComplianceGap represents the gap record returned from compliance.gaps
@@ -119,6 +127,28 @@ type reportTable struct {
 	Title   string
 	Headers []string
 	Rows    [][]string
+}
+
+const aiServiceTimeout = 12 * time.Second
+const processingRetryBaseDelay = time.Minute
+const processingRetryMaxDelay = 30 * time.Minute
+
+type aiServiceResponse struct {
+	StatusCode int
+	Body       []byte
+}
+
+type rateLimitEntry struct {
+	Count   int
+	ResetAt time.Time
+}
+
+type slidingWindowLimiter struct {
+	mu      sync.Mutex
+	entries map[string]rateLimitEntry
+	limit   int
+	window  time.Duration
+	now     func() time.Time
 }
 
 func main() {
@@ -181,12 +211,9 @@ func main() {
 	}
 
 	accessKeyID := os.Getenv("S3_ACCESS_KEY_ID")
-	if accessKeyID == "" {
-		accessKeyID = "plantbrain"
-	}
 	secretAccessKey := os.Getenv("S3_SECRET_ACCESS_KEY")
-	if secretAccessKey == "" {
-		secretAccessKey = "plantbrain123"
+	if accessKeyID == "" || secretAccessKey == "" {
+		log.Fatal("Fatal: S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be configured")
 	}
 
 	minioClient, err := minio.New(endpoint, &minio.Options{
@@ -217,11 +244,23 @@ func main() {
 
 	// 4. Setup Gin Router
 	r := gin.Default()
+	r.Use(RequestContextMiddleware())
 
 	// CORS Middleware
 	r.Use(func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+		origin := c.GetHeader("Origin")
+		allowedOrigins := strings.Split(os.Getenv("CORS_ALLOWED_ORIGINS"), ",")
+		if len(allowedOrigins) == 1 && strings.TrimSpace(allowedOrigins[0]) == "" {
+			allowedOrigins = []string{"http://localhost:3000"}
+		}
+		for _, allowedOrigin := range allowedOrigins {
+			if origin != "" && origin == strings.TrimSpace(allowedOrigin) {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+				c.Writer.Header().Set("Vary", "Origin")
+				c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+				break
+			}
+		}
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
 
@@ -231,27 +270,31 @@ func main() {
 		}
 		c.Next()
 	})
+	r.Use(RateLimitMiddleware(300, time.Minute))
 
 	// Auth Middleware
 	authGroup := r.Group("/api")
 	authGroup.Use(AuthMiddleware(dbPool))
+	authGroup.Use(RateLimitMiddleware(120, time.Minute))
 
 	// Endpoints
 	authGroup.GET("/me", handleGetMe())
-	authGroup.GET("/documents", handleGetDocuments(dbPool))
-	authGroup.GET("/documents/:id", handleGetDocumentDetail(dbPool))
-	authGroup.GET("/documents/:id/status", handleGetDocumentStatus(dbPool))
-	authGroup.GET("/documents/:id/download", handleGetDocumentDownloadURL(dbPool, minioClient, bucketName))
-	authGroup.POST("/documents/upload", handleDocumentUpload(dbPool, minioClient, bucketName, aiServiceURL, storageBaseURL(useSSL, endpoint)))
-	authGroup.DELETE("/documents/:id", RequireRoles("admin", "engineer"), handleArchiveDocument(dbPool))
-	authGroup.POST("/copilot/query", handleCopilotQuery(dbPool, aiServiceURL))
+	authGroup.GET("/documents", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer", "viewer"), handleGetDocuments(dbPool))
+	authGroup.GET("/documents/:id", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer", "viewer"), handleGetDocumentDetail(dbPool))
+	authGroup.GET("/documents/:id/status", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer", "viewer"), handleGetDocumentStatus(dbPool))
+	authGroup.GET("/documents/:id/download", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer", "viewer"), handleGetDocumentDownloadURL(dbPool, minioClient, bucketName))
+	authGroup.POST("/documents/upload", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer"), handleDocumentUpload(dbPool, minioClient, bucketName, aiServiceURL, storageBaseURL(useSSL, endpoint)))
+	authGroup.POST("/documents/:id/versions", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer"), handleDocumentVersionUpload(dbPool, minioClient, bucketName, aiServiceURL, storageBaseURL(useSSL, endpoint)))
+	authGroup.POST("/documents/:id/retry-processing", RequireRoles("admin", "plant_manager", "engineer", "compliance_officer"), handleRetryDocumentProcessing(dbPool, aiServiceURL))
+	authGroup.DELETE("/documents/:id", RequireRoles("admin", "plant_manager", "engineer", "compliance_officer"), handleArchiveDocument(dbPool))
+	authGroup.POST("/copilot/query", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer", "viewer"), handleCopilotQuery(dbPool, aiServiceURL))
 	authGroup.GET("/dashboard/metrics", RequireRoles("admin", "plant_manager", "engineer", "compliance_officer"), handleDashboardMetrics(dbPool))
-	authGroup.GET("/assets", handleGetAssets(dbPool))
-	authGroup.GET("/assets/:id", handleGetAssetByID(dbPool))
+	authGroup.GET("/assets", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer", "viewer"), handleGetAssets(dbPool))
+	authGroup.GET("/assets/:id", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer", "viewer"), handleGetAssetByID(dbPool))
 	authGroup.POST("/rca/generate", RequireRoles("admin", "plant_manager", "engineer"), handleRCAGenerate(dbPool, aiServiceURL))
 	authGroup.GET("/compliance/gaps", RequireRoles("admin", "plant_manager", "engineer", "compliance_officer"), handleGetComplianceGaps(dbPool))
 	authGroup.POST("/compliance/scan", RequireRoles("admin", "plant_manager", "compliance_officer"), handleComplianceScan(dbPool, aiServiceURL))
-	authGroup.GET("/graph", handleGetGraph(dbPool))
+	authGroup.GET("/graph", RequireRoles("admin", "plant_manager", "engineer", "technician", "compliance_officer", "viewer"), handleGetGraph(dbPool))
 	authGroup.GET("/reports", RequireRoles("admin", "plant_manager", "engineer", "compliance_officer"), handleListReportJobs(dbPool))
 	authGroup.POST("/reports", RequireRoles("admin", "plant_manager", "engineer", "compliance_officer"), handleCreateReportJob(dbPool))
 	authGroup.GET("/reports/:id/download", RequireRoles("admin", "plant_manager", "engineer", "compliance_officer"), handleDownloadReport(dbPool))
@@ -264,6 +307,106 @@ func main() {
 	log.Printf("API Server listening on port %s", port)
 	if err := r.Run(":" + port); err != nil {
 		log.Fatalf("Fatal: Server failed to start: %v", err)
+	}
+}
+
+func RequestContextMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		requestID := strings.TrimSpace(c.GetHeader("X-Request-ID"))
+		if requestID == "" || len(requestID) > 128 {
+			requestID = uuid.NewString()
+		}
+
+		start := time.Now()
+		c.Set("requestID", requestID)
+		c.Writer.Header().Set("X-Request-ID", requestID)
+
+		c.Next()
+
+		path := c.FullPath()
+		if path == "" {
+			path = c.Request.URL.Path
+		}
+		log.Printf(
+			"request_id=%s method=%s path=%s status=%d latency_ms=%d user_id=%s org_id=%s role=%s",
+			requestID,
+			c.Request.Method,
+			path,
+			c.Writer.Status(),
+			time.Since(start).Milliseconds(),
+			c.GetString("userID"),
+			c.GetString("orgID"),
+			c.GetString("role"),
+		)
+	}
+}
+
+func RateLimitMiddleware(limit int, window time.Duration) gin.HandlerFunc {
+	limiter := newSlidingWindowLimiter(limit, window)
+	return func(c *gin.Context) {
+		key := c.GetString("userID")
+		if key == "" {
+			key = c.ClientIP()
+		}
+		if key == "" {
+			key = "unknown"
+		}
+
+		allowed, retryAfter := limiter.Allow(key)
+		if !allowed {
+			c.Header("Retry-After", fmt.Sprintf("%.0f", retryAfter.Seconds()))
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error":           "too many requests, please retry shortly",
+				"retryAfterSec":   int(retryAfter.Seconds()),
+				"requestId":       c.GetString("requestID"),
+				"rateLimitWindow": window.String(),
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func newSlidingWindowLimiter(limit int, window time.Duration) *slidingWindowLimiter {
+	return &slidingWindowLimiter{
+		entries: make(map[string]rateLimitEntry),
+		limit:   limit,
+		window:  window,
+		now:     time.Now,
+	}
+}
+
+func (l *slidingWindowLimiter) Allow(key string) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.now()
+	entry, ok := l.entries[key]
+	if !ok || !now.Before(entry.ResetAt) {
+		l.entries[key] = rateLimitEntry{Count: 1, ResetAt: now.Add(l.window)}
+		l.cleanupExpired(now)
+		return true, 0
+	}
+
+	if entry.Count >= l.limit {
+		return false, entry.ResetAt.Sub(now)
+	}
+
+	entry.Count++
+	l.entries[key] = entry
+	return true, 0
+}
+
+func (l *slidingWindowLimiter) cleanupExpired(now time.Time) {
+	if len(l.entries) < 1000 {
+		return
+	}
+	for key, entry := range l.entries {
+		if !now.Before(entry.ResetAt) {
+			delete(l.entries, key)
+		}
 	}
 }
 
@@ -301,27 +444,56 @@ func AuthMiddleware(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		var plantIDStr *string
 		var roleStr *string
 
-		// Lookup session token in identity.sessions table joined with users, memberships, roles
-		query := `
-			SELECT 
-				s.user_id::text, 
-				u.organization_id::text, 
-				m.plant_id::text, 
-				r.name as role
-			FROM identity.sessions s
-			JOIN identity.users u ON s.user_id = u.id
-			LEFT JOIN identity.memberships m ON u.id = m.user_id
-			LEFT JOIN identity.roles r ON m.role_id = r.id
-			WHERE (s.token = $1 OR s.id = $1) AND s.expires_at > NOW()
-			LIMIT 1
-		`
+		// Try JWT first
+		if len(strings.Split(token, ".")) == 3 {
+			jwtSecret := os.Getenv("JWT_SECRET")
+			if jwtSecret != "" {
+				claims, err := parseJWTHS256(token, jwtSecret)
+				if err == nil {
+					if id, ok := claims["sub"].(string); ok {
+						userIDStr = id
+					} else if id, ok := claims["userId"].(string); ok {
+						userIDStr = id
+					}
 
-		err := dbPool.QueryRow(ctx, query, token).Scan(&userIDStr, &orgIDStr, &plantIDStr, &roleStr)
-		if err != nil {
-			log.Printf("Auth check failed for token '%s': %v", token, err)
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized: invalid or expired session"})
-			c.Abort()
-			return
+					if org, ok := claims["orgId"].(string); ok {
+						orgIDStr = org
+					}
+					if plant, ok := claims["plantId"].(string); ok {
+						plantIDStr = &plant
+					}
+					if role, ok := claims["role"].(string); ok {
+						roleStr = &role
+					}
+				} else {
+					log.Printf("JWT verification failed: %v", err)
+				}
+			}
+		}
+
+		// Fallback to session token in identity.sessions
+		if userIDStr == "" {
+			query := `
+				SELECT
+					s.user_id::text,
+					u.organization_id::text,
+					m.plant_id::text,
+					r.name as role
+				FROM identity.sessions s
+				JOIN identity.users u ON s.user_id = u.id
+				LEFT JOIN identity.memberships m ON u.id = m.user_id
+				LEFT JOIN identity.roles r ON m.role_id = r.id
+				WHERE (s.token = $1 OR s.id = $1) AND s.expires_at > NOW()
+				LIMIT 1
+			`
+
+			err := dbPool.QueryRow(ctx, query, token).Scan(&userIDStr, &orgIDStr, &plantIDStr, &roleStr)
+			if err != nil {
+				log.Printf("Auth check failed: %v", err)
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized: invalid or expired session"})
+				c.Abort()
+				return
+			}
 		}
 
 		// Set variables in context
@@ -340,6 +512,52 @@ func AuthMiddleware(dbPool *pgxpool.Pool) gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func parseJWTHS256(tokenString, secret string) (map[string]interface{}, error) {
+	parts := strings.Split(tokenString, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid token format")
+	}
+
+	headerPayload := parts[0] + "." + parts[1]
+
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		signature, err = base64.URLEncoding.DecodeString(parts[2])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(headerPayload))
+	expectedSignature := mac.Sum(nil)
+
+	if !hmac.Equal(signature, expectedSignature) {
+		return nil, fmt.Errorf("invalid signature")
+	}
+
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payloadBytes, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return nil, err
+	}
+
+	if exp, ok := claims["exp"].(float64); ok {
+		if time.Now().Unix() > int64(exp) {
+			return nil, fmt.Errorf("token expired")
+		}
+	}
+
+	return claims, nil
 }
 
 // RequireRoles enforces coarse-grained RBAC after AuthMiddleware has populated the request context.
@@ -396,6 +614,244 @@ func normalizeRole(role string) string {
 	}
 }
 
+type documentAccessPolicy struct {
+	AccessLevel  string
+	Sensitivity  string
+	AllowedRoles []string
+}
+
+func normalizeDocumentAccessLevel(accessLevel string) string {
+	normalized := strings.ToLower(strings.TrimSpace(accessLevel))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	normalized = strings.ReplaceAll(normalized, " ", "_")
+
+	switch normalized {
+	case "", "default":
+		return ""
+	case "public", "shared":
+		return "public"
+	case "internal", "plant", "plant_internal":
+		return "internal"
+	case "restricted", "role_restricted", "role_based":
+		return "restricted"
+	case "confidential", "sensitive":
+		return "confidential"
+	default:
+		return ""
+	}
+}
+
+func normalizeDocumentSensitivity(sensitivity string) string {
+	normalized := strings.ToLower(strings.TrimSpace(sensitivity))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	normalized = strings.ReplaceAll(normalized, " ", "_")
+
+	switch normalized {
+	case "", "default":
+		return ""
+	case "standard", "normal", "low":
+		return "standard"
+	case "sensitive", "restricted":
+		return "sensitive"
+	case "confidential":
+		return "confidential"
+	case "safety_critical", "safety", "critical":
+		return "safety_critical"
+	default:
+		return ""
+	}
+}
+
+func defaultDocumentAccessPolicy(documentType string) documentAccessPolicy {
+	docType := strings.ToLower(strings.TrimSpace(documentType))
+	docType = strings.ReplaceAll(docType, "-", " ")
+	docType = strings.ReplaceAll(docType, "_", " ")
+
+	policy := documentAccessPolicy{
+		AccessLevel: "internal",
+		Sensitivity: "standard",
+	}
+
+	switch {
+	case strings.Contains(docType, "compliance") ||
+		strings.Contains(docType, "regulatory") ||
+		strings.Contains(docType, "audit"):
+		policy.AccessLevel = "restricted"
+		policy.Sensitivity = "sensitive"
+		policy.AllowedRoles = []string{"admin", "plant_manager", "compliance_officer"}
+	case strings.Contains(docType, "incident") ||
+		strings.Contains(docType, "near miss") ||
+		strings.Contains(docType, "near-miss") ||
+		strings.Contains(docType, "rca") ||
+		strings.Contains(docType, "failure"):
+		policy.AccessLevel = "restricted"
+		policy.Sensitivity = "sensitive"
+		policy.AllowedRoles = []string{"admin", "plant_manager", "engineer", "compliance_officer"}
+	}
+
+	return policy
+}
+
+func parseAllowedDocumentRoles(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	var values []string
+	if strings.HasPrefix(raw, "[") {
+		if err := json.Unmarshal([]byte(raw), &values); err != nil {
+			return nil, fmt.Errorf("allowedRoles must be a comma-separated list or JSON array")
+		}
+	} else {
+		values = strings.FieldsFunc(raw, func(r rune) bool {
+			return r == ',' || r == ';' || r == '\n'
+		})
+	}
+
+	seen := map[string]bool{}
+	roles := []string{}
+	for _, value := range values {
+		role := normalizeRole(value)
+		if role == "" || seen[role] {
+			continue
+		}
+		seen[role] = true
+		roles = append(roles, role)
+	}
+	return roles, nil
+}
+
+func canSetSensitiveDocumentPolicy(role string) bool {
+	return roleAllowed(role, "admin", "plant_manager", "engineer", "compliance_officer")
+}
+
+func requestedSensitiveDocumentPolicy(accessLevel, sensitivity, allowedRoles string) bool {
+	return strings.TrimSpace(accessLevel) != "" ||
+		strings.TrimSpace(sensitivity) != "" ||
+		strings.TrimSpace(allowedRoles) != ""
+}
+
+func buildDocumentAccessPolicy(documentType, requestedAccessLevel, requestedSensitivity, requestedAllowedRoles, uploaderRole string) (documentAccessPolicy, error) {
+	policy := defaultDocumentAccessPolicy(documentType)
+
+	accessLevel := strings.TrimSpace(requestedAccessLevel)
+	if accessLevel != "" {
+		normalizedAccessLevel := normalizeDocumentAccessLevel(accessLevel)
+		if normalizedAccessLevel == "" {
+			return documentAccessPolicy{}, fmt.Errorf("invalid accessLevel")
+		}
+		policy.AccessLevel = normalizedAccessLevel
+	}
+
+	sensitivity := strings.TrimSpace(requestedSensitivity)
+	if sensitivity != "" {
+		normalizedSensitivity := normalizeDocumentSensitivity(sensitivity)
+		if normalizedSensitivity == "" {
+			return documentAccessPolicy{}, fmt.Errorf("invalid sensitivity")
+		}
+		policy.Sensitivity = normalizedSensitivity
+	}
+
+	allowedRoles, err := parseAllowedDocumentRoles(requestedAllowedRoles)
+	if err != nil {
+		return documentAccessPolicy{}, err
+	}
+	if allowedRoles != nil {
+		policy.AllowedRoles = allowedRoles
+	}
+
+	if requestedSensitiveDocumentPolicy(requestedAccessLevel, requestedSensitivity, requestedAllowedRoles) && !canSetSensitiveDocumentPolicy(uploaderRole) {
+		return documentAccessPolicy{}, fmt.Errorf("current role cannot set document access policy")
+	}
+
+	if (policy.AccessLevel == "restricted" || policy.AccessLevel == "confidential") && len(policy.AllowedRoles) == 0 {
+		policy.AllowedRoles = []string{"admin"}
+	}
+
+	return policy, nil
+}
+
+func documentReadableByRole(role, accessLevel string, allowedRoles []string) bool {
+	normalizedRole := normalizeRole(role)
+	if normalizedRole == "" {
+		return false
+	}
+	if normalizedRole == "admin" {
+		return true
+	}
+
+	normalizedAccessLevel := normalizeDocumentAccessLevel(accessLevel)
+	if normalizedAccessLevel == "" {
+		normalizedAccessLevel = "internal"
+	}
+
+	switch normalizedAccessLevel {
+	case "public", "internal":
+		return true
+	case "restricted", "confidential":
+		return roleAllowed(normalizedRole, allowedRoles...)
+	default:
+		return false
+	}
+}
+
+func requireDocumentAccess(c *gin.Context, accessLevel string, allowedRoles []string) bool {
+	if documentReadableByRole(c.GetString("role"), accessLevel, allowedRoles) {
+		return true
+	}
+
+	normalizedAccessLevel := normalizeDocumentAccessLevel(accessLevel)
+	if normalizedAccessLevel == "" {
+		normalizedAccessLevel = "internal"
+	}
+
+	c.JSON(http.StatusForbidden, gin.H{
+		"error":       "forbidden: document is restricted for this role",
+		"accessLevel": normalizedAccessLevel,
+		"currentRole": normalizeRole(c.GetString("role")),
+	})
+	c.Abort()
+	return false
+}
+
+func documentSourceRestricted(accessLevel string, allowedRoles []string) bool {
+	normalizedAccessLevel := normalizeDocumentAccessLevel(accessLevel)
+	if normalizedAccessLevel == "" {
+		normalizedAccessLevel = "internal"
+	}
+	return normalizedAccessLevel == "restricted" || normalizedAccessLevel == "confidential" || len(allowedRoles) > 0
+}
+
+type DocumentSourcePolicy struct {
+	ReadableAccessLevels []string
+	AllowedRoles         []string
+}
+
+func documentSourcePolicyForRole(role string) DocumentSourcePolicy {
+	normalizedRole := normalizeRole(role)
+	if normalizedRole == "admin" {
+		return DocumentSourcePolicy{
+			ReadableAccessLevels: []string{"public", "internal", "restricted", "confidential"},
+			AllowedRoles:         []string{},
+		}
+	}
+	return DocumentSourcePolicy{
+		ReadableAccessLevels: []string{"public", "internal"},
+		AllowedRoles:         []string{normalizedRole},
+	}
+}
+
+func documentAccessContextForRole(role string) map[string]interface{} {
+	normalizedRole := normalizeRole(role)
+	return map[string]interface{}{
+		"role":                 normalizedRole,
+		"isAdmin":              normalizedRole == "admin",
+		"readableAccessLevels": []string{"public", "internal"},
+		"allowedRoles":         []string{normalizedRole},
+	}
+}
+
 // GET /api/me
 func handleGetMe() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -421,12 +877,16 @@ func handleGetDocuments(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		}
 
 		ctx := c.Request.Context()
+		role := normalizeRole(c.GetString("role"))
 		rows, err := dbPool.Query(ctx, `
 			SELECT
 				d.id::text,
 				d.title,
 				COALESCE(v.file_type, ''),
 				COALESCE(d.document_type, ''),
+				COALESCE(d.access_level, 'internal'),
+				COALESCE(d.sensitivity, 'standard'),
+				COALESCE(d.allowed_roles, ARRAY[]::text[]),
 				d.status,
 				COALESCE(v.ocr_confidence, 0),
 				COALESCE(v.classification_confidence, 0),
@@ -446,10 +906,11 @@ func handleGetDocuments(dbPool *pgxpool.Pool) gin.HandlerFunc {
 
 		documents := []gin.H{}
 		for rows.Next() {
-			var id, title, fileType, documentType, status string
+			var id, title, fileType, documentType, accessLevel, sensitivity, status string
+			var allowedRoles []string
 			var ocrConfidence, classificationConfidence float64
 			var createdAt time.Time
-			if err := rows.Scan(&id, &title, &fileType, &documentType, &status, &ocrConfidence, &classificationConfidence, &createdAt); err != nil {
+			if err := rows.Scan(&id, &title, &fileType, &documentType, &accessLevel, &sensitivity, &allowedRoles, &status, &ocrConfidence, &classificationConfidence, &createdAt); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to scan document: %v", err)})
 				return
 			}
@@ -458,6 +919,11 @@ func handleGetDocuments(dbPool *pgxpool.Pool) gin.HandlerFunc {
 				"title":                    title,
 				"fileType":                 strings.ToUpper(fileType),
 				"documentType":             documentType,
+				"accessLevel":              accessLevel,
+				"sensitivity":              sensitivity,
+				"allowedRoles":             allowedRoles,
+				"sourceRestricted":         documentSourceRestricted(accessLevel, allowedRoles),
+				"sourceDownloadAllowed":    documentReadableByRole(role, accessLevel, allowedRoles),
 				"status":                   status,
 				"ocrConfidence":            ocrConfidence,
 				"classificationConfidence": classificationConfidence,
@@ -526,6 +992,323 @@ func jsonTextList(raw []byte) []string {
 	return []string{string(raw)}
 }
 
+func auditMetadataJSON(c *gin.Context, metadata map[string]interface{}) []byte {
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	metadata["requestId"] = c.GetString("requestID")
+	metadata["method"] = c.Request.Method
+	path := c.FullPath()
+	if path == "" {
+		path = c.Request.URL.Path
+	}
+	metadata["path"] = path
+
+	payload, err := json.Marshal(metadata)
+	if err != nil {
+		return []byte("{}")
+	}
+	return payload
+}
+
+func recordAuditEvent(c *gin.Context, dbPool *pgxpool.Pool, plantID, eventType, resourceType, resourceID string, metadata map[string]interface{}) {
+	_, _ = dbPool.Exec(c.Request.Context(), `
+		INSERT INTO audit.events (organization_id, plant_id, actor_user_id, event_type, resource_type, resource_id, correlation_id, metadata_json)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, c.GetString("orgID"), nullableUUID(plantID), nullableUUID(c.GetString("userID")), eventType, resourceType, resourceID, c.GetString("requestID"), auditMetadataJSON(c, metadata))
+}
+
+func callAIService(ctx context.Context, method, aiServiceURL, path string, body []byte) (aiServiceResponse, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, aiServiceTimeout)
+	defer cancel()
+
+	target := strings.TrimRight(aiServiceURL, "/") + path
+	req, err := http.NewRequestWithContext(reqCtx, method, target, bytes.NewReader(body))
+	if err != nil {
+		return aiServiceResponse{}, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return aiServiceResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return aiServiceResponse{}, err
+	}
+
+	return aiServiceResponse{StatusCode: resp.StatusCode, Body: respBody}, nil
+}
+
+func aiFailureReason(err error, response aiServiceResponse) string {
+	if err != nil {
+		return err.Error()
+	}
+	if len(response.Body) == 0 {
+		return fmt.Sprintf("AI service returned HTTP %d", response.StatusCode)
+	}
+	body := strings.TrimSpace(string(response.Body))
+	if len(body) > 300 {
+		body = body[:300]
+	}
+	return fmt.Sprintf("AI service returned HTTP %d: %s", response.StatusCode, body)
+}
+
+func fallbackCopilotResponse(question, reason string) gin.H {
+	missingInfo := []string{"AI service unavailable or timed out; retry the query after processing services recover"}
+	if strings.TrimSpace(reason) != "" {
+		missingInfo = append(missingInfo, reason)
+	}
+	return gin.H{
+		"answer":        "Not enough evidence is available to answer safely right now because the AI service could not complete the request.",
+		"confidence":    0.0,
+		"citations":     []gin.H{},
+		"relatedAssets": extractAssetTags(question),
+		"missingInfo":   missingInfo,
+		"fallback":      true,
+	}
+}
+
+func fallbackRCAResponse(assetTag, reason string) gin.H {
+	missingData := []string{"AI service unavailable or timed out; RCA could not be generated from evidence"}
+	if strings.TrimSpace(reason) != "" {
+		missingData = append(missingData, reason)
+	}
+	return gin.H{
+		"summary":         fmt.Sprintf("RCA for %s could not be generated safely because the AI service is unavailable.", strings.ToUpper(strings.TrimSpace(assetTag))),
+		"probableCauses":  []string{"Data unavailable"},
+		"recommendations": []string{"Retry RCA generation after AI processing is healthy", "Review available work orders and inspection records manually before taking action"},
+		"confidence":      0.0,
+		"citations":       []gin.H{},
+		"missingData":     missingData,
+		"fallback":        true,
+	}
+}
+
+func extractAssetTags(text string) []string {
+	fields := strings.FieldsFunc(strings.ToUpper(text), func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '-'
+	})
+
+	seen := map[string]bool{}
+	tags := []string{}
+	for _, field := range fields {
+		field = strings.Trim(field, "-")
+		if field == "" || seen[field] || !looksLikeAssetTag(field) {
+			continue
+		}
+		seen[field] = true
+		tags = append(tags, field)
+	}
+	return tags
+}
+
+func looksLikeAssetTag(value string) bool {
+	hasLetter := false
+	hasDigit := false
+	hasSeparator := strings.Contains(value, "-")
+	for _, r := range value {
+		if r >= 'A' && r <= 'Z' {
+			hasLetter = true
+		}
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+		}
+	}
+	return hasLetter && hasDigit && hasSeparator
+}
+
+func terminalProcessingStatus(status string) bool {
+	switch strings.ToUpper(status) {
+	case "COMPLETED", "FAILED", "PARTIAL_SUCCESS", "ARCHIVED":
+		return true
+	default:
+		return false
+	}
+}
+
+func activeProcessingStatus(status string) bool {
+	switch strings.ToUpper(status) {
+	case "QUEUED", "DISPATCHING", "EXTRACTING_TEXT", "OCR_RUNNING", "CONVERTING_TO_MARKDOWN", "DETECTING_TABLES", "CHUNKING", "EXTRACTING_ENTITIES", "GENERATING_EMBEDDINGS", "STORING_RESULTS":
+		return true
+	default:
+		return false
+	}
+}
+
+func documentStatusForProcessingJob(status string) string {
+	if strings.EqualFold(status, "QUEUED") {
+		return "UPLOADED"
+	}
+	return status
+}
+
+func processingRetryDelay(attempts int) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	delay := processingRetryBaseDelay
+	for i := 1; i < attempts; i++ {
+		delay *= 2
+		if delay >= processingRetryMaxDelay {
+			return processingRetryMaxDelay
+		}
+	}
+	return delay
+}
+
+func processingNextRetryAt(status string, attempts int, now time.Time) *time.Time {
+	switch strings.ToUpper(status) {
+	case "QUEUED":
+		retryAt := now
+		return &retryAt
+	case "FAILED":
+		retryAt := now.Add(processingRetryDelay(attempts))
+		return &retryAt
+	default:
+		return nil
+	}
+}
+
+func processingJobMetadataJSON(metadata map[string]interface{}) []byte {
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	payload, err := json.Marshal(metadata)
+	if err != nil {
+		return []byte("{}")
+	}
+	return payload
+}
+
+func upsertProcessingJob(ctx context.Context, dbPool *pgxpool.Pool, documentID, documentVersionID, orgID, status, errorMessage string, progress float64, incrementAttempts bool) error {
+	attemptIncrement := 0
+	if incrementAttempts {
+		attemptIncrement = 1
+	}
+	completed := terminalProcessingStatus(status)
+	documentStatus := documentStatusForProcessingJob(status)
+	now := time.Now().UTC()
+	nextRetryAt := processingNextRetryAt(status, attemptIncrement, now)
+	metadataJSON := processingJobMetadataJSON(map[string]interface{}{
+		"lastTransition": status,
+	})
+
+	_, err := dbPool.Exec(ctx, `
+		UPDATE document.documents
+		SET status = $1, updated_at = NOW()
+		WHERE id = $2 AND organization_id = $3
+	`, documentStatus, documentID, orgID)
+	if err != nil {
+		return err
+	}
+
+	_, err = dbPool.Exec(ctx, `
+		INSERT INTO ingestion.processing_jobs (
+			document_id, document_version_id, status, error_message, attempts, progress,
+			last_attempted_at, next_retry_at, locked_at, locked_by, metadata_json,
+			started_at, completed_at, created_at, updated_at
+		)
+		VALUES (
+			$1, $2, $3, NULLIF($4, ''), $5, $6,
+			CASE WHEN $5 > 0 THEN NOW() ELSE NULL END, $8, NULL, NULL, $9,
+			NOW(), CASE WHEN $7 THEN NOW() ELSE NULL END, NOW(), NOW()
+		)
+		ON CONFLICT (document_id, document_version_id)
+		DO UPDATE SET
+			status = EXCLUDED.status,
+			error_message = EXCLUDED.error_message,
+			progress = EXCLUDED.progress,
+			attempts = ingestion.processing_jobs.attempts + $5,
+			last_attempted_at = CASE WHEN $5 > 0 THEN NOW() ELSE ingestion.processing_jobs.last_attempted_at END,
+			next_retry_at = $8,
+			locked_at = NULL,
+			locked_by = NULL,
+			metadata_json = ingestion.processing_jobs.metadata_json || EXCLUDED.metadata_json,
+			started_at = CASE WHEN $5 > 0 THEN NOW() ELSE COALESCE(ingestion.processing_jobs.started_at, NOW()) END,
+			completed_at = CASE WHEN $7 THEN NOW() ELSE NULL END,
+			updated_at = NOW()
+	`, documentID, documentVersionID, status, errorMessage, attemptIncrement, progress, completed, nextRetryAt, metadataJSON)
+	return err
+}
+
+func lockProcessingJobForDispatch(ctx context.Context, dbPool *pgxpool.Pool, documentID, documentVersionID, lockedBy string) (int, error) {
+	var attempts int
+	err := dbPool.QueryRow(ctx, `
+		UPDATE ingestion.processing_jobs
+		SET status = 'DISPATCHING',
+		    attempts = attempts + 1,
+		    last_attempted_at = NOW(),
+		    next_retry_at = NULL,
+		    locked_at = NOW(),
+		    locked_by = NULLIF($3, ''),
+		    error_message = NULL,
+		    metadata_json = metadata_json || $4,
+		    updated_at = NOW()
+		WHERE document_id = $1 AND document_version_id = $2
+		RETURNING attempts
+	`, documentID, documentVersionID, lockedBy, processingJobMetadataJSON(map[string]interface{}{
+		"lastTransition": "DISPATCHING",
+		"lockedBy":       lockedBy,
+	})).Scan(&attempts)
+	return attempts, err
+}
+
+func completeProcessingDispatch(ctx context.Context, dbPool *pgxpool.Pool, documentID, documentVersionID, orgID, status, errorMessage string, progress float64, attempts int, metadata map[string]interface{}) error {
+	completed := terminalProcessingStatus(status)
+	documentStatus := documentStatusForProcessingJob(status)
+	nextRetryAt := processingNextRetryAt(status, attempts, time.Now().UTC())
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	metadata["lastTransition"] = status
+
+	_, err := dbPool.Exec(ctx, `
+		UPDATE document.documents
+		SET status = $1, updated_at = NOW()
+		WHERE id = $2 AND organization_id = $3
+	`, documentStatus, documentID, orgID)
+	if err != nil {
+		return err
+	}
+
+	_, err = dbPool.Exec(ctx, `
+		UPDATE ingestion.processing_jobs
+		SET status = $3,
+		    error_message = NULLIF($4, ''),
+		    progress = $5,
+		    next_retry_at = $6,
+		    locked_at = NULL,
+		    locked_by = NULL,
+		    metadata_json = metadata_json || $7,
+		    completed_at = CASE WHEN $8 THEN NOW() ELSE NULL END,
+		    updated_at = NOW()
+		WHERE document_id = $1 AND document_version_id = $2
+	`, documentID, documentVersionID, status, errorMessage, progress, nextRetryAt, processingJobMetadataJSON(metadata), completed)
+	return err
+}
+
+func uploadedFilePath(documentID, fileType string) string {
+	uploadsDir := os.Getenv("UPLOADS_DIR")
+	if uploadsDir == "" {
+		uploadsDir = "/app/uploads"
+	}
+	return filepath.Join(uploadsDir, fmt.Sprintf("%s.%s", documentID, strings.TrimPrefix(strings.ToLower(fileType), ".")))
+}
+
+func triggerDocumentProcessing(ctx context.Context, aiServiceURL string, processReq map[string]interface{}) (aiServiceResponse, error) {
+	payloadBytes, err := json.Marshal(processReq)
+	if err != nil {
+		return aiServiceResponse{}, err
+	}
+	return callAIService(ctx, http.MethodPost, aiServiceURL, "/process-document", payloadBytes)
+}
+
 func requirePlantAccess(c *gin.Context, dbPool *pgxpool.Pool, plantID string) bool {
 	if plantID == "" {
 		return true
@@ -562,7 +1345,8 @@ func handleGetDocumentDetail(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		orgID := c.GetString("orgID")
 		ctx := c.Request.Context()
 
-		var documentID, organizationID, plantID, title, documentType, status string
+		var documentID, organizationID, plantID, title, documentType, accessLevel, sensitivity, status string
+		var allowedRoles []string
 		var uploadedBy *string
 		var createdAt, updatedAt time.Time
 		var versionID, versionLabel, fileURL, fileType, fileSHA, markdownContent *string
@@ -576,6 +1360,9 @@ func handleGetDocumentDetail(dbPool *pgxpool.Pool) gin.HandlerFunc {
 				d.plant_id::text,
 				d.title,
 				COALESCE(d.document_type, ''),
+				COALESCE(d.access_level, 'internal'),
+				COALESCE(d.sensitivity, 'standard'),
+				COALESCE(d.allowed_roles, ARRAY[]::text[]),
 				d.status,
 				d.uploaded_by::text,
 				d.created_at,
@@ -593,7 +1380,7 @@ func handleGetDocumentDetail(dbPool *pgxpool.Pool) gin.HandlerFunc {
 			LEFT JOIN document.document_versions v ON d.current_version_id = v.id
 			WHERE d.id = $1 AND d.organization_id = $2
 		`, docID, orgID).Scan(
-			&documentID, &organizationID, &plantID, &title, &documentType, &status, &uploadedBy, &createdAt, &updatedAt,
+			&documentID, &organizationID, &plantID, &title, &documentType, &accessLevel, &sensitivity, &allowedRoles, &status, &uploadedBy, &createdAt, &updatedAt,
 			&versionID, &versionLabel, &fileURL, &fileType, &fileSHA, &markdownContent, &ocrConfidence, &classificationConfidence, &versionCreatedAt,
 		)
 		if err != nil {
@@ -603,122 +1390,143 @@ func handleGetDocumentDetail(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		if !requirePlantAccess(c, dbPool, plantID) {
 			return
 		}
+		sourceDownloadAllowed := documentReadableByRole(c.GetString("role"), accessLevel, allowedRoles)
 
 		pages := []gin.H{}
-		pageRows, err := dbPool.Query(ctx, `
-			SELECT page_no, COALESCE(raw_text, ''), COALESCE(markdown_text, ''), COALESCE(ocr_confidence, 0), metadata_json
-			FROM ingestion.document_pages
-			WHERE document_id = $1
-			ORDER BY page_no
-		`, docID)
-		if err == nil {
-			defer pageRows.Close()
-			for pageRows.Next() {
-				var pageNo int
-				var rawText, markdownText string
-				var confidence float64
-				var metadata []byte
-				if err := pageRows.Scan(&pageNo, &rawText, &markdownText, &confidence, &metadata); err == nil {
-					pages = append(pages, gin.H{
-						"pageNo":        pageNo,
-						"rawText":       rawText,
-						"markdownText":  markdownText,
-						"ocrConfidence": confidence,
-						"metadata":      json.RawMessage(metadata),
-					})
+		if sourceDownloadAllowed {
+			pageRows, err := dbPool.Query(ctx, `
+				SELECT page_no, COALESCE(raw_text, ''), COALESCE(markdown_text, ''), COALESCE(ocr_confidence, 0), metadata_json
+				FROM ingestion.document_pages
+				WHERE document_id = $1
+				  AND ($2::uuid IS NULL OR document_version_id = $2::uuid)
+				ORDER BY page_no
+			`, docID, versionID)
+			if err == nil {
+				defer pageRows.Close()
+				for pageRows.Next() {
+					var pageNo int
+					var rawText, markdownText string
+					var confidence float64
+					var metadata []byte
+					if err := pageRows.Scan(&pageNo, &rawText, &markdownText, &confidence, &metadata); err == nil {
+						pages = append(pages, gin.H{
+							"pageNo":        pageNo,
+							"rawText":       rawText,
+							"markdownText":  markdownText,
+							"ocrConfidence": confidence,
+							"metadata":      json.RawMessage(metadata),
+						})
+					}
 				}
 			}
 		}
 
 		chunks := []gin.H{}
-		chunkRows, err := dbPool.Query(ctx, `
-			SELECT id::text, page_no, chunk_index, chunk_text, COALESCE(token_count, 0), metadata_json
-			FROM ingestion.document_chunks
-			WHERE document_id = $1
-			ORDER BY chunk_index
-			LIMIT 50
-		`, docID)
-		if err == nil {
-			defer chunkRows.Close()
-			for chunkRows.Next() {
-				var id, text string
-				var pageNo *int
-				var chunkIndex, tokenCount int
-				var metadata []byte
-				if err := chunkRows.Scan(&id, &pageNo, &chunkIndex, &text, &tokenCount, &metadata); err == nil {
-					chunks = append(chunks, gin.H{
-						"id":         id,
-						"pageNo":     pageNo,
-						"chunkIndex": chunkIndex,
-						"text":       text,
-						"tokenCount": tokenCount,
-						"metadata":   json.RawMessage(metadata),
-					})
+		if sourceDownloadAllowed {
+			chunkRows, err := dbPool.Query(ctx, `
+				SELECT id::text, page_no, chunk_index, chunk_text, COALESCE(token_count, 0), metadata_json
+				FROM ingestion.document_chunks
+				WHERE document_id = $1
+				  AND ($2::uuid IS NULL OR document_version_id = $2::uuid)
+				ORDER BY chunk_index
+				LIMIT 50
+			`, docID, versionID)
+			if err == nil {
+				defer chunkRows.Close()
+				for chunkRows.Next() {
+					var id, text string
+					var pageNo *int
+					var chunkIndex, tokenCount int
+					var metadata []byte
+					if err := chunkRows.Scan(&id, &pageNo, &chunkIndex, &text, &tokenCount, &metadata); err == nil {
+						chunks = append(chunks, gin.H{
+							"id":         id,
+							"pageNo":     pageNo,
+							"chunkIndex": chunkIndex,
+							"text":       text,
+							"tokenCount": tokenCount,
+							"metadata":   json.RawMessage(metadata),
+						})
+					}
 				}
 			}
 		}
 
 		entities := []gin.H{}
-		entityRows, err := dbPool.Query(ctx, `
-			SELECT id::text, entity_type, entity_value, COALESCE(normalized_value, ''), COALESCE(confidence, 0), page_no
-			FROM graph.entities
-			WHERE document_id = $1
-			ORDER BY confidence DESC, entity_type, entity_value
-			LIMIT 100
-		`, docID)
-		if err == nil {
-			defer entityRows.Close()
-			for entityRows.Next() {
-				var id, entityType, entityValue, normalized string
-				var confidence float64
-				var pageNo *int
-				if err := entityRows.Scan(&id, &entityType, &entityValue, &normalized, &confidence, &pageNo); err == nil {
-					entities = append(entities, gin.H{
-						"id":              id,
-						"type":            entityType,
-						"value":           entityValue,
-						"normalizedValue": normalized,
-						"confidence":      confidence,
-						"pageNo":          pageNo,
-					})
+		if sourceDownloadAllowed {
+			entityRows, err := dbPool.Query(ctx, `
+				SELECT e.id::text, e.entity_type, e.entity_value, COALESCE(e.normalized_value, ''), COALESCE(e.confidence, 0), e.page_no
+				FROM graph.entities e
+				LEFT JOIN ingestion.document_chunks c ON e.chunk_id = c.id
+				WHERE e.document_id = $1
+				  AND ($2::uuid IS NULL OR e.chunk_id IS NULL OR c.document_version_id = $2::uuid)
+				ORDER BY e.confidence DESC, e.entity_type, e.entity_value
+				LIMIT 100
+			`, docID, versionID)
+			if err == nil {
+				defer entityRows.Close()
+				for entityRows.Next() {
+					var id, entityType, entityValue, normalized string
+					var confidence float64
+					var pageNo *int
+					if err := entityRows.Scan(&id, &entityType, &entityValue, &normalized, &confidence, &pageNo); err == nil {
+						entities = append(entities, gin.H{
+							"id":              id,
+							"type":            entityType,
+							"value":           entityValue,
+							"normalizedValue": normalized,
+							"confidence":      confidence,
+							"pageNo":          pageNo,
+						})
+					}
 				}
 			}
 		}
 
-		_, _ = dbPool.Exec(ctx, `
-			INSERT INTO audit.events (organization_id, plant_id, actor_user_id, event_type, resource_type, resource_id, metadata_json)
-			VALUES ($1, $2, $3, 'DOCUMENT_VIEWED', 'document', $4, '{}')
-		`, orgID, plantID, c.GetString("userID"), docID)
+		recordAuditEvent(c, dbPool, plantID, "DOCUMENT_VIEWED", "document", docID, map[string]interface{}{
+			"status":       status,
+			"documentType": documentType,
+			"accessLevel":  accessLevel,
+			"sensitivity":  sensitivity,
+			"sourceAccess": sourceDownloadAllowed,
+		})
 
 		version := gin.H{}
 		if versionID != nil {
 			version = gin.H{
 				"id":                       *versionID,
 				"versionLabel":             stringValue(versionLabel),
-				"fileUrl":                  stringValue(fileURL),
 				"fileType":                 stringValue(fileType),
-				"fileSha256":               stringValue(fileSHA),
-				"markdownContent":          stringValue(markdownContent),
 				"ocrConfidence":            floatValue(ocrConfidence),
 				"classificationConfidence": floatValue(classificationConfidence),
 				"createdAt":                versionCreatedAt,
 			}
+			if sourceDownloadAllowed {
+				version["fileUrl"] = stringValue(fileURL)
+				version["fileSha256"] = stringValue(fileSHA)
+				version["markdownContent"] = stringValue(markdownContent)
+			}
 		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"id":             documentID,
-			"organizationId": organizationID,
-			"plantId":        plantID,
-			"title":          title,
-			"documentType":   documentType,
-			"status":         status,
-			"uploadedBy":     uploadedBy,
-			"createdAt":      createdAt,
-			"updatedAt":      updatedAt,
-			"currentVersion": version,
-			"pages":          pages,
-			"chunks":         chunks,
-			"entities":       entities,
+			"id":                    documentID,
+			"organizationId":        organizationID,
+			"plantId":               plantID,
+			"title":                 title,
+			"documentType":          documentType,
+			"accessLevel":           accessLevel,
+			"sensitivity":           sensitivity,
+			"allowedRoles":          allowedRoles,
+			"sourceRestricted":      documentSourceRestricted(accessLevel, allowedRoles),
+			"sourceDownloadAllowed": sourceDownloadAllowed,
+			"status":                status,
+			"uploadedBy":            uploadedBy,
+			"createdAt":             createdAt,
+			"updatedAt":             updatedAt,
+			"currentVersion":        version,
+			"pages":                 pages,
+			"chunks":                chunks,
+			"entities":              entities,
 		})
 	}
 }
@@ -729,15 +1537,20 @@ func handleGetDocumentStatus(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		docID := c.Param("id")
 		orgID := c.GetString("orgID")
 
-		var plantID, documentStatus string
+		var plantID, accessLevel, documentStatus string
+		var allowedRoles []string
 		var updatedAt time.Time
-		var versionID, jobID, jobStatus, errorMessage *string
+		var versionID, jobID, jobStatus, errorMessage, lockedBy *string
 		var progress *float64
-		var startedAt, completedAt, jobUpdatedAt *time.Time
+		var attempts *int
+		var startedAt, completedAt, jobUpdatedAt, lastAttemptedAt, nextRetryAt, lockedAt *time.Time
+		var metadataJSONBytes []byte
 
 		err := dbPool.QueryRow(c.Request.Context(), `
 			SELECT
 				d.plant_id::text,
+				COALESCE(d.access_level, 'internal'),
+				COALESCE(d.allowed_roles, ARRAY[]::text[]),
 				d.status,
 				d.updated_at,
 				d.current_version_id::text,
@@ -745,25 +1558,50 @@ func handleGetDocumentStatus(dbPool *pgxpool.Pool) gin.HandlerFunc {
 				j.status,
 				j.error_message,
 				j.progress,
+				j.attempts,
+				j.last_attempted_at,
+				j.next_retry_at,
+				j.locked_at,
+				j.locked_by,
 				j.started_at,
 				j.completed_at,
-				j.updated_at
+				j.updated_at,
+				j.metadata_json
 			FROM document.documents d
 			LEFT JOIN LATERAL (
-				SELECT id, status, error_message, progress, started_at, completed_at, updated_at
+				SELECT id, status, error_message, progress, attempts, last_attempted_at, next_retry_at, locked_at, locked_by, started_at, completed_at, updated_at, metadata_json
 				FROM ingestion.processing_jobs
 				WHERE document_id = d.id
 				ORDER BY created_at DESC
 				LIMIT 1
 			) j ON TRUE
 			WHERE d.id = $1 AND d.organization_id = $2
-		`, docID, orgID).Scan(&plantID, &documentStatus, &updatedAt, &versionID, &jobID, &jobStatus, &errorMessage, &progress, &startedAt, &completedAt, &jobUpdatedAt)
+		`, docID, orgID).Scan(&plantID, &accessLevel, &allowedRoles, &documentStatus, &updatedAt, &versionID, &jobID, &jobStatus, &errorMessage, &progress, &attempts, &lastAttemptedAt, &nextRetryAt, &lockedAt, &lockedBy, &startedAt, &completedAt, &jobUpdatedAt, &metadataJSONBytes)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "document not found"})
 			return
 		}
 		if !requirePlantAccess(c, dbPool, plantID) {
 			return
+		}
+
+		processingAttempts := 0
+		if attempts != nil {
+			processingAttempts = *attempts
+		}
+		processingStatus := documentStatus
+		if jobStatus != nil && *jobStatus != "" {
+			processingStatus = *jobStatus
+		}
+		retryAvailable := strings.EqualFold(processingStatus, "FAILED") || strings.EqualFold(documentStatus, "FAILED")
+		retryURL := ""
+		if retryAvailable {
+			retryURL = fmt.Sprintf("/api/documents/%s/retry-processing", docID)
+		}
+
+		var errorMetadata map[string]interface{}
+		if len(metadataJSONBytes) > 0 {
+			json.Unmarshal(metadataJSONBytes, &errorMetadata)
 		}
 
 		c.JSON(http.StatusOK, gin.H{
@@ -773,12 +1611,21 @@ func handleGetDocumentStatus(dbPool *pgxpool.Pool) gin.HandlerFunc {
 			"currentVersionId":   versionID,
 			"updatedAt":          updatedAt,
 			"processingJobId":    jobID,
-			"processingStatus":   jobStatus,
+			"processingStatus":   processingStatus,
 			"processingProgress": floatValue(progress),
+			"processingAttempts": processingAttempts,
+			"attempts":           processingAttempts,
+			"retryAvailable":     retryAvailable,
+			"retryUrl":           retryURL,
 			"errorMessage":       errorMessage,
+			"lastAttemptedAt":    lastAttemptedAt,
+			"nextRetryAt":        nextRetryAt,
+			"lockedAt":           lockedAt,
+			"lockedBy":           lockedBy,
 			"startedAt":          startedAt,
 			"completedAt":        completedAt,
 			"jobUpdatedAt":       jobUpdatedAt,
+			"errorMetadata":      errorMetadata,
 		})
 	}
 }
@@ -788,14 +1635,22 @@ func handleGetDocumentDownloadURL(dbPool *pgxpool.Pool, minioClient *minio.Clien
 	return func(c *gin.Context) {
 		docID := c.Param("id")
 		orgID := c.GetString("orgID")
-		userID := c.GetString("userID")
 		ctx := c.Request.Context()
 
-		var plantID, title, status string
+		var plantID, title, accessLevel, sensitivity, status string
+		var allowedRoles []string
 		var objectKey *string
 		var fileType *string
 		err := dbPool.QueryRow(ctx, `
-			SELECT d.plant_id::text, d.title, d.status, u.object_key, v.file_type
+			SELECT
+				d.plant_id::text,
+				d.title,
+				COALESCE(d.access_level, 'internal'),
+				COALESCE(d.sensitivity, 'standard'),
+				COALESCE(d.allowed_roles, ARRAY[]::text[]),
+				d.status,
+				u.object_key,
+				v.file_type
 			FROM document.documents d
 			LEFT JOIN LATERAL (
 				SELECT object_key
@@ -808,7 +1663,7 @@ func handleGetDocumentDownloadURL(dbPool *pgxpool.Pool, minioClient *minio.Clien
 			) u ON TRUE
 			LEFT JOIN document.document_versions v ON d.current_version_id = v.id
 			WHERE d.id = $1 AND d.organization_id = $2
-		`, docID, orgID).Scan(&plantID, &title, &status, &objectKey, &fileType)
+		`, docID, orgID).Scan(&plantID, &title, &accessLevel, &sensitivity, &allowedRoles, &status, &objectKey, &fileType)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "document not found"})
 			return
@@ -818,6 +1673,9 @@ func handleGetDocumentDownloadURL(dbPool *pgxpool.Pool, minioClient *minio.Clien
 			return
 		}
 		if !requirePlantAccess(c, dbPool, plantID) {
+			return
+		}
+		if !requireDocumentAccess(c, accessLevel, allowedRoles) {
 			return
 		}
 		if objectKey == nil || *objectKey == "" {
@@ -834,13 +1692,15 @@ func handleGetDocumentDownloadURL(dbPool *pgxpool.Pool, minioClient *minio.Clien
 			return
 		}
 
-		_, _ = dbPool.Exec(ctx, `
-			INSERT INTO audit.events (organization_id, plant_id, actor_user_id, event_type, resource_type, resource_id, metadata_json)
-			VALUES ($1, $2, $3, 'DOCUMENT_DOWNLOAD_LINK_CREATED', 'document', $4, $5)
-		`, orgID, plantID, userID, docID, []byte(fmt.Sprintf(`{"objectKey":%q,"expiresInSeconds":600}`, *objectKey)))
+		recordAuditEvent(c, dbPool, plantID, "DOCUMENT_DOWNLOAD_LINK_CREATED", "document", docID, map[string]interface{}{
+			"objectKey":        *objectKey,
+			"expiresInSeconds": 600,
+		})
 
 		c.JSON(http.StatusOK, gin.H{
 			"documentId":   docID,
+			"accessLevel":  accessLevel,
+			"sensitivity":  sensitivity,
 			"downloadUrl":  signedURL.String(),
 			"expiresAt":    time.Now().Add(10 * time.Minute),
 			"expiresInSec": 600,
@@ -856,17 +1716,21 @@ func handleArchiveDocument(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		userID := c.GetString("userID")
 		ctx := c.Request.Context()
 
-		var plantID string
+		var plantID, accessLevel string
+		var allowedRoles []string
 		err := dbPool.QueryRow(ctx, `
-			SELECT plant_id::text
+			SELECT plant_id::text, COALESCE(access_level, 'internal'), COALESCE(allowed_roles, ARRAY[]::text[])
 			FROM document.documents
 			WHERE id = $1 AND organization_id = $2
-		`, docID, orgID).Scan(&plantID)
+		`, docID, orgID).Scan(&plantID, &accessLevel, &allowedRoles)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "document not found"})
 			return
 		}
 		if !requirePlantAccess(c, dbPool, plantID) {
+			return
+		}
+		if !requireDocumentAccess(c, accessLevel, allowedRoles) {
 			return
 		}
 
@@ -918,9 +1782,11 @@ func handleArchiveDocument(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		}
 
 		if _, err = tx.Exec(ctx, `
-			INSERT INTO audit.events (organization_id, plant_id, actor_user_id, event_type, resource_type, resource_id, metadata_json)
-			VALUES ($1, $2, $3, 'DOCUMENT_ARCHIVED', 'document', $4, '{}')
-		`, orgID, plantID, userID, docID); err != nil {
+			INSERT INTO audit.events (organization_id, plant_id, actor_user_id, event_type, resource_type, resource_id, correlation_id, metadata_json)
+			VALUES ($1, $2, $3, 'DOCUMENT_ARCHIVED', 'document', $4, $5, $6)
+		`, orgID, plantID, userID, docID, c.GetString("requestID"), auditMetadataJSON(c, map[string]interface{}{
+			"derivedArtifactsRemoved": true,
+		})); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to record archive audit event: %v", err)})
 			return
 		}
@@ -944,6 +1810,38 @@ func storageBaseURL(useSSL bool, endpoint string) string {
 		scheme = "https"
 	}
 	return fmt.Sprintf("%s://%s", scheme, strings.TrimRight(endpoint, "/"))
+}
+
+func cleanupDocumentDerivedData(ctx context.Context, tx pgx.Tx, docID, orgID string) error {
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM graph.relationships r
+		USING graph.entities e
+		WHERE (r.source_entity_id = e.id OR r.target_entity_id = e.id)
+		  AND e.document_id = $1
+		  AND r.organization_id = $2
+	`, docID, orgID); err != nil {
+		return err
+	}
+
+	statements := []string{
+		`DELETE FROM graph.relationships WHERE evidence_document_id = $1 AND organization_id = $2`,
+		`DELETE FROM graph.entities WHERE document_id = $1 AND organization_id = $2`,
+		`DELETE FROM rag.citations WHERE document_id = $1`,
+		`DELETE FROM ingestion.document_chunks WHERE document_id = $1`,
+		`DELETE FROM ingestion.document_pages WHERE document_id = $1`,
+	}
+	for _, stmt := range statements {
+		if strings.Contains(stmt, "$2") {
+			if _, err := tx.Exec(ctx, stmt, docID, orgID); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := tx.Exec(ctx, stmt, docID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func allowedDocumentExtension(ext string) bool {
@@ -978,6 +1876,21 @@ func handleDocumentUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucke
 
 		orgID := c.GetString("orgID")
 		userID := c.GetString("userID")
+		accessPolicy, err := buildDocumentAccessPolicy(
+			documentType,
+			c.PostForm("accessLevel"),
+			c.PostForm("sensitivity"),
+			c.PostForm("allowedRoles"),
+			c.GetString("role"),
+		)
+		if err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "cannot set document access policy") {
+				status = http.StatusForbidden
+			}
+			c.JSON(status, gin.H{"error": err.Error()})
+			return
+		}
 
 		if plantID == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "plantId field is required"})
@@ -999,11 +1912,28 @@ func handleDocumentUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucke
 
 		docID := uuid.New()
 		versionID := uuid.New()
+
+		const maxUploadSize = 50 * 1024 * 1024 // 50 MB
+		if header.Size > maxUploadSize {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "file size exceeds 50MB limit"})
+			return
+		}
+
 		ext := filepath.Ext(header.Filename)
 		if !allowedDocumentExtension(ext) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported file type"})
 			return
 		}
+
+		if strings.ToLower(ext) == ".pdf" {
+			buf := make([]byte, 5)
+			if _, err := io.ReadFull(file, buf); err != nil || string(buf) != "%PDF-" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "corrupt PDF file"})
+				return
+			}
+			file.Seek(0, io.SeekStart)
+		}
+
 		localFileName := fmt.Sprintf("%s%s", docID.String(), ext)
 		localFilePath := filepath.Join(uploadsDir, localFileName)
 
@@ -1051,6 +1981,10 @@ func handleDocumentUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucke
 		`, orgID, plantID, fileSHA256).Scan(&duplicateDocID, &duplicateStatus)
 		if err == nil {
 			_ = os.Remove(localFilePath)
+			recordAuditEvent(c, dbPool, plantID, "DOCUMENT_UPLOAD_DUPLICATE_DETECTED", "document", duplicateDocID, map[string]interface{}{
+				"fileName":   header.Filename,
+				"fileSha256": fileSHA256,
+			})
 			c.JSON(http.StatusOK, gin.H{
 				"documentId": duplicateDocID,
 				"status":     duplicateStatus,
@@ -1101,9 +2035,12 @@ func handleDocumentUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucke
 
 		// 1. Insert into document.documents
 		_, err = tx.Exec(ctx, `
-			INSERT INTO document.documents (id, organization_id, plant_id, title, document_type, current_version_id, status, uploaded_by, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, NULL, 'UPLOADED', $6, NOW(), NOW())
-		`, docID, orgID, plantID, header.Filename, documentType, userID)
+			INSERT INTO document.documents (
+				id, organization_id, plant_id, title, document_type, access_level, sensitivity, allowed_roles,
+				current_version_id, status, uploaded_by, created_at, updated_at
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, 'UPLOADED', $9, NOW(), NOW())
+		`, docID, orgID, plantID, header.Filename, documentType, accessPolicy.AccessLevel, accessPolicy.Sensitivity, accessPolicy.AllowedRoles, userID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to insert document metadata: %v", err)})
 			return
@@ -1140,9 +2077,42 @@ func handleDocumentUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucke
 		}
 
 		_, err = tx.Exec(ctx, `
-			INSERT INTO audit.events (organization_id, plant_id, actor_user_id, event_type, resource_type, resource_id, metadata_json)
-			VALUES ($1, $2, $3, 'DOCUMENT_UPLOADED', 'document', $4, $5)
-		`, orgID, plantID, userID, docID.String(), []byte(fmt.Sprintf(`{"fileName":%q,"fileSha256":%q,"objectKey":%q}`, header.Filename, fileSHA256, objectKey)))
+			INSERT INTO ingestion.processing_jobs (
+				document_id, document_version_id, status, attempts, progress,
+				next_retry_at, metadata_json, created_at, updated_at
+			)
+			VALUES ($1, $2, 'QUEUED', 0, 0, NOW(), $3, NOW(), NOW())
+			ON CONFLICT (document_id, document_version_id)
+			DO UPDATE SET
+				status = 'QUEUED',
+				error_message = NULL,
+				progress = 0,
+				next_retry_at = NOW(),
+				locked_at = NULL,
+				locked_by = NULL,
+				metadata_json = ingestion.processing_jobs.metadata_json || EXCLUDED.metadata_json,
+				updated_at = NOW()
+		`, docID, versionID, processingJobMetadataJSON(map[string]interface{}{
+			"source":         "document_upload",
+			"requestId":      c.GetString("requestID"),
+			"lastTransition": "QUEUED",
+		}))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create processing job: %v", err)})
+			return
+		}
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO audit.events (organization_id, plant_id, actor_user_id, event_type, resource_type, resource_id, correlation_id, metadata_json)
+			VALUES ($1, $2, $3, 'DOCUMENT_UPLOADED', 'document', $4, $5, $6)
+		`, orgID, plantID, userID, docID.String(), c.GetString("requestID"), auditMetadataJSON(c, map[string]interface{}{
+			"fileName":     header.Filename,
+			"fileSha256":   fileSHA256,
+			"objectKey":    objectKey,
+			"accessLevel":  accessPolicy.AccessLevel,
+			"sensitivity":  accessPolicy.Sensitivity,
+			"allowedRoles": accessPolicy.AllowedRoles,
+		}))
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to record audit event: %v", err)})
 			return
@@ -1163,47 +2133,595 @@ func handleDocumentUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucke
 				"documentType":   documentType,
 				"title":          header.Filename,
 				"organizationId": orgID,
+				"accessLevel":    accessPolicy.AccessLevel,
+				"sensitivity":    accessPolicy.Sensitivity,
+				"allowedRoles":   accessPolicy.AllowedRoles,
 			},
 		}
 
-		payloadBytes, err := json.Marshal(processReq)
+		dispatchAttempts, err := lockProcessingJobForDispatch(ctx, dbPool, docID.String(), versionID.String(), c.GetString("requestID"))
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to marshal AI request: %v", err)})
+			reason := fmt.Sprintf("failed to lock processing job for dispatch: %v", err)
+			_ = upsertProcessingJob(ctx, dbPool, docID.String(), versionID.String(), orgID, "FAILED", reason, 0, true)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": reason})
 			return
 		}
 
-		resp, err := http.Post(
-			fmt.Sprintf("%s/process-document", aiServiceURL),
-			"application/json",
-			strings.NewReader(string(payloadBytes)),
-		)
+		aiResp, err := triggerDocumentProcessing(ctx, aiServiceURL, processReq)
 		if err != nil {
+			reason := aiFailureReason(err, aiResp)
 			log.Printf("Warning: Failed to call Python AI Service: %v", err)
-			// Return UPLOADED since the file is safely stored, but warn that processing pipeline invocation failed
+			_ = completeProcessingDispatch(ctx, dbPool, docID.String(), versionID.String(), orgID, "FAILED", reason, 0, dispatchAttempts, map[string]interface{}{
+				"aiStatusCode": aiResp.StatusCode,
+				"requestId":    c.GetString("requestID"),
+			})
+			recordAuditEvent(c, dbPool, plantID, "DOCUMENT_PROCESSING_TRIGGER_FAILED", "document", docID.String(), map[string]interface{}{
+				"reason":   reason,
+				"attempts": dispatchAttempts,
+			})
 			c.JSON(http.StatusOK, gin.H{
-				"documentId": docID.String(),
-				"status":     "UPLOADED",
-				"message":    "Document uploaded but AI ingestion trigger failed: " + err.Error(),
+				"documentId":         docID.String(),
+				"status":             "FAILED",
+				"processingStatus":   "FAILED",
+				"processingProgress": 0,
+				"processingAttempts": dispatchAttempts,
+				"attempts":           dispatchAttempts,
+				"retryAvailable":     true,
+				"retryUrl":           fmt.Sprintf("/api/documents/%s/retry-processing", docID.String()),
+				"accessLevel":        accessPolicy.AccessLevel,
+				"sensitivity":        accessPolicy.Sensitivity,
+				"allowedRoles":       accessPolicy.AllowedRoles,
+				"message":            "Document uploaded, but AI ingestion trigger failed and can be retried",
 			})
 			return
 		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-			respBody, _ := io.ReadAll(resp.Body)
-			log.Printf("Warning: AI service returned status %d: %s", resp.StatusCode, string(respBody))
+		if aiResp.StatusCode != http.StatusOK && aiResp.StatusCode != http.StatusAccepted {
+			reason := aiFailureReason(nil, aiResp)
+			log.Printf("Warning: AI service returned status %d: %s", aiResp.StatusCode, string(aiResp.Body))
+			_ = completeProcessingDispatch(ctx, dbPool, docID.String(), versionID.String(), orgID, "FAILED", reason, 0, dispatchAttempts, map[string]interface{}{
+				"aiStatusCode": aiResp.StatusCode,
+				"requestId":    c.GetString("requestID"),
+			})
+			recordAuditEvent(c, dbPool, plantID, "DOCUMENT_PROCESSING_TRIGGER_FAILED", "document", docID.String(), map[string]interface{}{
+				"reason":       reason,
+				"attempts":     dispatchAttempts,
+				"aiStatusCode": aiResp.StatusCode,
+			})
 			c.JSON(http.StatusOK, gin.H{
-				"documentId": docID.String(),
-				"status":     "UPLOADED",
-				"message":    fmt.Sprintf("Document uploaded, but AI service returned error: %s", string(respBody)),
+				"documentId":         docID.String(),
+				"status":             "FAILED",
+				"processingStatus":   "FAILED",
+				"processingProgress": 0,
+				"processingAttempts": dispatchAttempts,
+				"attempts":           dispatchAttempts,
+				"retryAvailable":     true,
+				"retryUrl":           fmt.Sprintf("/api/documents/%s/retry-processing", docID.String()),
+				"accessLevel":        accessPolicy.AccessLevel,
+				"sensitivity":        accessPolicy.Sensitivity,
+				"allowedRoles":       accessPolicy.AllowedRoles,
+				"message":            "Document uploaded, but AI ingestion was not accepted and can be retried",
 			})
 			return
 		}
 
+		_ = completeProcessingDispatch(ctx, dbPool, docID.String(), versionID.String(), orgID, "QUEUED", "", 0, dispatchAttempts, map[string]interface{}{
+			"aiStatusCode": aiResp.StatusCode,
+			"requestId":    c.GetString("requestID"),
+		})
+		recordAuditEvent(c, dbPool, plantID, "DOCUMENT_PROCESSING_QUEUED", "document", docID.String(), map[string]interface{}{
+			"aiStatusCode": aiResp.StatusCode,
+			"attempts":     dispatchAttempts,
+		})
 		c.JSON(http.StatusOK, gin.H{
-			"documentId": docID.String(),
-			"status":     "UPLOADED",
-			"message":    "Document uploaded and queued for processing",
+			"documentId":         docID.String(),
+			"status":             "UPLOADED",
+			"processingStatus":   "QUEUED",
+			"processingProgress": 0,
+			"processingAttempts": dispatchAttempts,
+			"attempts":           dispatchAttempts,
+			"retryAvailable":     false,
+			"retryUrl":           "",
+			"accessLevel":        accessPolicy.AccessLevel,
+			"sensitivity":        accessPolicy.Sensitivity,
+			"allowedRoles":       accessPolicy.AllowedRoles,
+			"message":            "Document uploaded and queued for processing",
+		})
+	}
+}
+
+// POST /api/documents/:id/versions
+func handleDocumentVersionUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucketName, aiServiceURL, s3Endpoint string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		docID := c.Param("id")
+		orgID := c.GetString("orgID")
+		userID := c.GetString("userID")
+		ctx := c.Request.Context()
+
+		file, header, err := c.Request.FormFile("file")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "file field is required"})
+			return
+		}
+		defer file.Close()
+
+		var plantID, title, documentType, accessLevel, sensitivity string
+		var allowedRoles []string
+		var versionCount int
+		var latestJobStatus *string
+		err = dbPool.QueryRow(ctx, `
+			SELECT
+				d.plant_id::text,
+				d.title,
+				COALESCE(d.document_type, ''),
+				COALESCE(d.access_level, 'internal'),
+				COALESCE(d.sensitivity, 'standard'),
+				COALESCE(d.allowed_roles, ARRAY[]::text[]),
+				(SELECT COUNT(*) FROM document.document_versions WHERE document_id = d.id),
+				j.status
+			FROM document.documents d
+			LEFT JOIN LATERAL (
+				SELECT status
+				FROM ingestion.processing_jobs
+				WHERE document_id = d.id AND document_version_id = d.current_version_id
+				ORDER BY updated_at DESC, created_at DESC
+				LIMIT 1
+			) j ON TRUE
+			WHERE d.id = $1
+			  AND d.organization_id = $2
+			  AND d.status <> 'ARCHIVED'
+		`, docID, orgID).Scan(&plantID, &title, &documentType, &accessLevel, &sensitivity, &allowedRoles, &versionCount, &latestJobStatus)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "document not found"})
+			return
+		}
+		if !requirePlantAccess(c, dbPool, plantID) {
+			return
+		}
+		if !requireDocumentAccess(c, accessLevel, allowedRoles) {
+			return
+		}
+		if latestJobStatus != nil && activeProcessingStatus(*latestJobStatus) {
+			c.JSON(http.StatusConflict, gin.H{
+				"documentId": docID,
+				"status":     *latestJobStatus,
+				"message":    "cannot upload a new version while processing is active",
+			})
+			return
+		}
+
+		ext := filepath.Ext(header.Filename)
+		const maxVersionUploadSize = 50 * 1024 * 1024 // 50 MB
+		if header.Size > maxVersionUploadSize {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "file size exceeds 50MB limit"})
+			return
+		}
+		if !allowedDocumentExtension(ext) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported file type"})
+			return
+		}
+		if strings.ToLower(ext) == ".pdf" {
+			buf := make([]byte, 5)
+			if _, err := io.ReadFull(file, buf); err != nil || string(buf) != "%PDF-" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "corrupt PDF file"})
+				return
+			}
+			if _, err := file.Seek(0, io.SeekStart); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to reset uploaded file: %v", err)})
+				return
+			}
+		}
+
+		uploadsDir := os.Getenv("UPLOADS_DIR")
+		if uploadsDir == "" {
+			uploadsDir = "/app/uploads"
+		}
+		if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create upload directory: %v", err)})
+			return
+		}
+
+		localFilePath := filepath.Join(uploadsDir, fmt.Sprintf("%s%s", docID, ext))
+		out, err := os.Create(localFilePath)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create local file: %v", err)})
+			return
+		}
+		hasher := sha256.New()
+		if _, err := io.Copy(io.MultiWriter(out, hasher), file); err != nil {
+			out.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save local file: %v", err)})
+			return
+		}
+		out.Close()
+
+		fileSHA256 := hex.EncodeToString(hasher.Sum(nil))
+		localStat, err := os.Stat(localFilePath)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to inspect uploaded file: %v", err)})
+			return
+		}
+		if localStat.Size() == 0 {
+			_ = os.Remove(localFilePath)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "uploaded file is empty"})
+			return
+		}
+
+		var duplicateVersion string
+		err = dbPool.QueryRow(ctx, `
+			SELECT version_label
+			FROM document.document_versions
+			WHERE document_id = $1
+			  AND file_sha256 = $2
+			ORDER BY created_at DESC
+			LIMIT 1
+		`, docID, fileSHA256).Scan(&duplicateVersion)
+		if err == nil {
+			_ = os.Remove(localFilePath)
+			c.JSON(http.StatusOK, gin.H{
+				"documentId": docID,
+				"status":     "DUPLICATE_VERSION",
+				"duplicate":  true,
+				"message":    fmt.Sprintf("This file already exists as %s", duplicateVersion),
+			})
+			return
+		}
+		if err != pgx.ErrNoRows {
+			_ = os.Remove(localFilePath)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to check duplicate version: %v", err)})
+			return
+		}
+
+		versionLabel := strings.TrimSpace(c.PostForm("versionLabel"))
+		if versionLabel == "" {
+			versionLabel = strings.TrimSpace(c.PostForm("version"))
+		}
+		if versionLabel == "" {
+			versionLabel = fmt.Sprintf("v%d", versionCount+1)
+		}
+		if len(versionLabel) > 40 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "version label must be 40 characters or fewer"})
+			return
+		}
+
+		minioFile, err := os.Open(localFilePath)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to open file for MinIO upload: %v", err)})
+			return
+		}
+		defer minioFile.Close()
+		fileStat, err := minioFile.Stat()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to stat file for MinIO upload: %v", err)})
+			return
+		}
+
+		objectKey := fmt.Sprintf("uploads/%s/%s/%s", docID, safeFilePart(versionLabel), filepath.Base(header.Filename))
+		_, err = minioClient.PutObject(ctx, bucketName, objectKey, minioFile, fileStat.Size(), minio.PutObjectOptions{
+			ContentType: header.Header.Get("Content-Type"),
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to upload to MinIO: %v", err)})
+			return
+		}
+		fileURL := fmt.Sprintf("%s/%s/%s", strings.TrimRight(s3Endpoint, "/"), bucketName, objectKey)
+		versionID := uuid.New()
+		nextTitle := strings.TrimSpace(c.PostForm("title"))
+		if nextTitle == "" {
+			nextTitle = title
+		}
+
+		tx, err := dbPool.Begin(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to start database transaction: %v", err)})
+			return
+		}
+		defer tx.Rollback(ctx)
+
+		if err := cleanupDocumentDerivedData(ctx, tx, docID, orgID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to clear previous derived data: %v", err)})
+			return
+		}
+
+		if _, err = tx.Exec(ctx, `
+			INSERT INTO document.document_versions (id, document_id, version_label, file_url, file_type, file_sha256, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+		`, versionID, docID, versionLabel, fileURL, strings.TrimPrefix(ext, "."), fileSHA256); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to insert document version: %v", err)})
+			return
+		}
+
+		if _, err = tx.Exec(ctx, `
+			UPDATE document.documents
+			SET current_version_id = $1,
+			    title = $2,
+			    status = 'UPLOADED',
+			    updated_at = NOW()
+			WHERE id = $3 AND organization_id = $4
+		`, versionID, nextTitle, docID, orgID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to activate document version: %v", err)})
+			return
+		}
+
+		if _, err = tx.Exec(ctx, `
+			INSERT INTO document.upload_sessions (document_id, organization_id, plant_id, object_key, status, created_by, created_at, completed_at)
+			VALUES ($1, $2, $3, $4, 'COMPLETED', $5, NOW(), NOW())
+		`, docID, orgID, plantID, objectKey, userID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to record upload session: %v", err)})
+			return
+		}
+
+		if _, err = tx.Exec(ctx, `
+			INSERT INTO ingestion.processing_jobs (
+				document_id, document_version_id, status, attempts, progress,
+				next_retry_at, metadata_json, created_at, updated_at
+			)
+			VALUES ($1, $2, 'QUEUED', 0, 0, NOW(), $3, NOW(), NOW())
+			ON CONFLICT (document_id, document_version_id)
+			DO UPDATE SET
+				status = 'QUEUED',
+				error_message = NULL,
+				progress = 0,
+				next_retry_at = NOW(),
+				locked_at = NULL,
+				locked_by = NULL,
+				metadata_json = ingestion.processing_jobs.metadata_json || EXCLUDED.metadata_json,
+				updated_at = NOW()
+		`, docID, versionID, processingJobMetadataJSON(map[string]interface{}{
+			"source":         "document_version_upload",
+			"requestId":      c.GetString("requestID"),
+			"versionLabel":   versionLabel,
+			"lastTransition": "QUEUED",
+		})); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create processing job: %v", err)})
+			return
+		}
+
+		if _, err = tx.Exec(ctx, `
+			INSERT INTO audit.events (organization_id, plant_id, actor_user_id, event_type, resource_type, resource_id, correlation_id, metadata_json)
+			VALUES ($1, $2, $3, 'DOCUMENT_VERSION_UPLOADED', 'document', $4, $5, $6)
+		`, orgID, plantID, userID, docID, c.GetString("requestID"), auditMetadataJSON(c, map[string]interface{}{
+			"versionId":    versionID.String(),
+			"versionLabel": versionLabel,
+			"fileName":     header.Filename,
+			"fileSha256":   fileSHA256,
+			"objectKey":    objectKey,
+			"accessLevel":  accessLevel,
+			"sensitivity":  sensitivity,
+		})); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to record audit event: %v", err)})
+			return
+		}
+
+		if err = tx.Commit(ctx); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to commit document version: %v", err)})
+			return
+		}
+
+		processReq := map[string]interface{}{
+			"document_id": docID,
+			"file_path":   localFilePath,
+			"file_type":   strings.TrimPrefix(ext, "."),
+			"metadata": map[string]interface{}{
+				"plantId":        plantID,
+				"documentType":   documentType,
+				"title":          nextTitle,
+				"organizationId": orgID,
+				"accessLevel":    accessLevel,
+				"sensitivity":    sensitivity,
+				"allowedRoles":   allowedRoles,
+				"versionLabel":   versionLabel,
+			},
+		}
+		dispatchAttempts, err := lockProcessingJobForDispatch(ctx, dbPool, docID, versionID.String(), c.GetString("requestID"))
+		if err != nil {
+			reason := fmt.Sprintf("failed to lock processing job for dispatch: %v", err)
+			_ = upsertProcessingJob(ctx, dbPool, docID, versionID.String(), orgID, "FAILED", reason, 0, true)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": reason})
+			return
+		}
+
+		aiResp, err := triggerDocumentProcessing(ctx, aiServiceURL, processReq)
+		if err != nil || (aiResp.StatusCode != http.StatusOK && aiResp.StatusCode != http.StatusAccepted) {
+			reason := aiFailureReason(err, aiResp)
+			_ = completeProcessingDispatch(ctx, dbPool, docID, versionID.String(), orgID, "FAILED", reason, 0, dispatchAttempts, map[string]interface{}{
+				"aiStatusCode": aiResp.StatusCode,
+				"requestId":    c.GetString("requestID"),
+				"versionLabel": versionLabel,
+			})
+			recordAuditEvent(c, dbPool, plantID, "DOCUMENT_VERSION_PROCESSING_TRIGGER_FAILED", "document", docID, map[string]interface{}{
+				"reason":       reason,
+				"versionId":    versionID.String(),
+				"versionLabel": versionLabel,
+				"attempts":     dispatchAttempts,
+			})
+			c.JSON(http.StatusOK, gin.H{
+				"documentId":         docID,
+				"versionId":          versionID.String(),
+				"versionLabel":       versionLabel,
+				"status":             "FAILED",
+				"processingStatus":   "FAILED",
+				"processingProgress": 0,
+				"processingAttempts": dispatchAttempts,
+				"attempts":           dispatchAttempts,
+				"retryAvailable":     true,
+				"retryUrl":           fmt.Sprintf("/api/documents/%s/retry-processing", docID),
+				"message":            "Document version uploaded, but AI ingestion trigger failed and can be retried",
+			})
+			return
+		}
+
+		_ = completeProcessingDispatch(ctx, dbPool, docID, versionID.String(), orgID, "QUEUED", "", 0, dispatchAttempts, map[string]interface{}{
+			"aiStatusCode": aiResp.StatusCode,
+			"requestId":    c.GetString("requestID"),
+			"versionLabel": versionLabel,
+		})
+		recordAuditEvent(c, dbPool, plantID, "DOCUMENT_VERSION_PROCESSING_QUEUED", "document", docID, map[string]interface{}{
+			"aiStatusCode": aiResp.StatusCode,
+			"versionId":    versionID.String(),
+			"versionLabel": versionLabel,
+			"attempts":     dispatchAttempts,
+		})
+		c.JSON(http.StatusAccepted, gin.H{
+			"documentId":         docID,
+			"versionId":          versionID.String(),
+			"versionLabel":       versionLabel,
+			"status":             "UPLOADED",
+			"processingStatus":   "QUEUED",
+			"processingProgress": 0,
+			"processingAttempts": dispatchAttempts,
+			"attempts":           dispatchAttempts,
+			"retryAvailable":     false,
+			"retryUrl":           "",
+			"message":            "Document version uploaded and queued for processing",
+		})
+	}
+}
+
+// POST /api/documents/:id/retry-processing
+func handleRetryDocumentProcessing(dbPool *pgxpool.Pool, aiServiceURL string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		docID := c.Param("id")
+		orgID := c.GetString("orgID")
+		ctx := c.Request.Context()
+
+		var plantID, title, documentType, accessLevel, sensitivity, versionID, fileType string
+		var allowedRoles []string
+		var latestJobStatus *string
+		err := dbPool.QueryRow(ctx, `
+			SELECT
+				d.plant_id::text,
+				d.title,
+				COALESCE(d.document_type, ''),
+				COALESCE(d.access_level, 'internal'),
+				COALESCE(d.sensitivity, 'standard'),
+				COALESCE(d.allowed_roles, ARRAY[]::text[]),
+				v.id::text,
+				v.file_type,
+				j.status
+			FROM document.documents d
+			JOIN document.document_versions v ON d.current_version_id = v.id
+			LEFT JOIN LATERAL (
+				SELECT status
+				FROM ingestion.processing_jobs
+				WHERE document_id = d.id AND document_version_id = v.id
+				ORDER BY updated_at DESC, created_at DESC
+				LIMIT 1
+			) j ON TRUE
+			WHERE d.id = $1
+			  AND d.organization_id = $2
+			  AND d.status <> 'ARCHIVED'
+		`, docID, orgID).Scan(&plantID, &title, &documentType, &accessLevel, &sensitivity, &allowedRoles, &versionID, &fileType, &latestJobStatus)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "document not found"})
+			return
+		}
+		if !requirePlantAccess(c, dbPool, plantID) {
+			return
+		}
+		if !requireDocumentAccess(c, accessLevel, allowedRoles) {
+			return
+		}
+		if latestJobStatus != nil && activeProcessingStatus(*latestJobStatus) {
+			c.JSON(http.StatusConflict, gin.H{
+				"documentId":       docID,
+				"status":           *latestJobStatus,
+				"processingStatus": *latestJobStatus,
+				"retryAvailable":   false,
+				"message":          "document processing is already active",
+			})
+			return
+		}
+
+		localFilePath := uploadedFilePath(docID, fileType)
+		if _, err := os.Stat(localFilePath); err != nil {
+			recordAuditEvent(c, dbPool, plantID, "DOCUMENT_PROCESSING_RETRY_MISSING_FILE", "document", docID, map[string]interface{}{
+				"filePath": localFilePath,
+				"reason":   err.Error(),
+			})
+			c.JSON(http.StatusConflict, gin.H{
+				"documentId":       docID,
+				"status":           "FAILED",
+				"processingStatus": "FAILED",
+				"retryAvailable":   false,
+				"message":          "cannot retry processing because the shared local upload file is missing",
+			})
+			return
+		}
+
+		if err := upsertProcessingJob(ctx, dbPool, docID, versionID, orgID, "QUEUED", "", 0, false); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to queue processing retry: %v", err)})
+			return
+		}
+		dispatchAttempts, err := lockProcessingJobForDispatch(ctx, dbPool, docID, versionID, c.GetString("requestID"))
+		if err != nil {
+			reason := fmt.Sprintf("failed to lock processing job for retry dispatch: %v", err)
+			_ = upsertProcessingJob(ctx, dbPool, docID, versionID, orgID, "FAILED", reason, 0, true)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": reason})
+			return
+		}
+
+		processReq := map[string]interface{}{
+			"document_id": docID,
+			"file_path":   localFilePath,
+			"file_type":   fileType,
+			"metadata": map[string]interface{}{
+				"plantId":        plantID,
+				"documentType":   documentType,
+				"title":          title,
+				"organizationId": orgID,
+				"accessLevel":    accessLevel,
+				"sensitivity":    sensitivity,
+				"allowedRoles":   allowedRoles,
+				"retry":          true,
+			},
+		}
+
+		aiResp, err := triggerDocumentProcessing(ctx, aiServiceURL, processReq)
+		if err != nil || (aiResp.StatusCode != http.StatusOK && aiResp.StatusCode != http.StatusAccepted) {
+			reason := aiFailureReason(err, aiResp)
+			_ = completeProcessingDispatch(ctx, dbPool, docID, versionID, orgID, "FAILED", reason, 0, dispatchAttempts, map[string]interface{}{
+				"aiStatusCode": aiResp.StatusCode,
+				"requestId":    c.GetString("requestID"),
+				"manualRetry":  true,
+			})
+			recordAuditEvent(c, dbPool, plantID, "DOCUMENT_PROCESSING_RETRY_FAILED", "document", docID, map[string]interface{}{
+				"reason":   reason,
+				"attempts": dispatchAttempts,
+			})
+			c.JSON(http.StatusOK, gin.H{
+				"documentId":         docID,
+				"status":             "FAILED",
+				"processingStatus":   "FAILED",
+				"processingProgress": 0,
+				"processingAttempts": dispatchAttempts,
+				"attempts":           dispatchAttempts,
+				"retryAvailable":     true,
+				"retryUrl":           fmt.Sprintf("/api/documents/%s/retry-processing", docID),
+				"message":            "processing retry could not be accepted by the AI service",
+			})
+			return
+		}
+
+		_ = completeProcessingDispatch(ctx, dbPool, docID, versionID, orgID, "QUEUED", "", 0, dispatchAttempts, map[string]interface{}{
+			"aiStatusCode": aiResp.StatusCode,
+			"requestId":    c.GetString("requestID"),
+			"manualRetry":  true,
+		})
+		recordAuditEvent(c, dbPool, plantID, "DOCUMENT_PROCESSING_RETRIED", "document", docID, map[string]interface{}{
+			"aiStatusCode": aiResp.StatusCode,
+			"attempts":     dispatchAttempts,
+		})
+		c.JSON(http.StatusAccepted, gin.H{
+			"documentId":         docID,
+			"status":             "QUEUED",
+			"processingStatus":   "QUEUED",
+			"processingProgress": 0,
+			"processingAttempts": dispatchAttempts,
+			"attempts":           dispatchAttempts,
+			"retryAvailable":     false,
+			"retryUrl":           "",
+			"message":            "Document processing retry queued",
 		})
 	}
 }
@@ -1223,6 +2741,12 @@ func handleCopilotQuery(dbPool *pgxpool.Pool, aiServiceURL string) gin.HandlerFu
 		}
 		req.UserID = c.GetString("userID")
 		req.OrganizationID = c.GetString("orgID")
+		req.UserRole = normalizeRole(c.GetString("role"))
+		req.AccessContext = documentAccessContextForRole(c.GetString("role"))
+		if req.Filters == nil {
+			req.Filters = map[string]interface{}{}
+		}
+		req.Filters["documentAccess"] = req.AccessContext
 
 		if req.PlantID == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "plantId is required"})
@@ -1238,24 +2762,22 @@ func handleCopilotQuery(dbPool *pgxpool.Pool, aiServiceURL string) gin.HandlerFu
 			return
 		}
 
-		resp, err := http.Post(
-			fmt.Sprintf("%s/query", aiServiceURL),
-			"application/json",
-			strings.NewReader(string(payloadBytes)),
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to AI service: %v", err)})
-			return
-		}
-		defer resp.Body.Close()
+		recordAuditEvent(c, dbPool, req.PlantID, "COPILOT_QUERY_REQUESTED", "copilot_query", "", map[string]interface{}{
+			"questionChars": len(req.Question),
+			"hasFilters":    len(req.Filters) > 0,
+		})
 
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read AI service response: %v", err)})
+		aiResp, err := callAIService(c.Request.Context(), http.MethodPost, aiServiceURL, "/query", payloadBytes)
+		if err != nil || aiResp.StatusCode < 200 || aiResp.StatusCode >= 300 {
+			reason := aiFailureReason(err, aiResp)
+			recordAuditEvent(c, dbPool, req.PlantID, "COPILOT_QUERY_FALLBACK", "copilot_query", "", map[string]interface{}{
+				"reason": reason,
+			})
+			c.JSON(http.StatusOK, fallbackCopilotResponse(req.Question, reason))
 			return
 		}
 
-		c.Data(resp.StatusCode, "application/json", respBody)
+		c.Data(aiResp.StatusCode, "application/json", aiResp.Body)
 	}
 }
 
@@ -1362,8 +2884,14 @@ func handleGetAssets(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		if plantID == "" {
 			plantID = c.GetString("plantID")
 		}
-		if plantID != "" && !requirePlantAccess(c, dbPool, plantID) {
-			return
+		if plantID != "" {
+			if _, err := uuid.Parse(plantID); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plantId format"})
+				return
+			}
+			if !requirePlantAccess(c, dbPool, plantID) {
+				return
+			}
 		}
 
 		var rows pgx.Rows
@@ -1423,6 +2951,10 @@ func handleGetAssets(dbPool *pgxpool.Pool) gin.HandlerFunc {
 			}
 			assets = append(assets, a)
 		}
+		if err := rows.Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "error iterating assets"})
+			return
+		}
 
 		c.JSON(http.StatusOK, assets)
 	}
@@ -1436,6 +2968,12 @@ func handleGetAssetByID(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		plantID := c.Query("plantId")
 		if plantID == "" {
 			plantID = c.GetString("plantID")
+		}
+		if plantID != "" {
+			if _, err := uuid.Parse(plantID); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plantId format"})
+				return
+			}
 		}
 		ctx := c.Request.Context()
 
@@ -1519,8 +3057,15 @@ func handleGetAssetByID(dbPool *pgxpool.Pool) gin.HandlerFunc {
 					f.ProbableCauses = jsonTextList(causesJSON)
 					f.Recommendations = jsonTextList(recsJSON)
 					failures = append(failures, f)
+				} else {
+					log.Printf("Failed to scan RCA report: %v", err)
 				}
 			}
+			if err := fRows.Err(); err != nil {
+				log.Printf("Error iterating RCA reports: %v", err)
+			}
+		} else {
+			log.Printf("Failed to query RCA reports: %v", err)
 		}
 
 		// Fetch compliance gaps
@@ -1545,8 +3090,15 @@ func handleGetAssetByID(dbPool *pgxpool.Pool) gin.HandlerFunc {
 						g.Status = *status
 					}
 					gaps = append(gaps, g)
+				} else {
+					log.Printf("Failed to scan compliance gap: %v", err)
 				}
 			}
+			if err := gRows.Err(); err != nil {
+				log.Printf("Error iterating compliance gaps: %v", err)
+			}
+		} else {
+			log.Printf("Failed to query compliance gaps: %v", err)
 		}
 
 		// Fetch linked documents via Graph Entities matching this asset's tag
@@ -1571,8 +3123,15 @@ func handleGetAssetByID(dbPool *pgxpool.Pool) gin.HandlerFunc {
 						d.DocumentType = *docType
 					}
 					documents = append(documents, d)
+				} else {
+					log.Printf("Failed to scan linked document: %v", err)
 				}
 			}
+			if err := dRows.Err(); err != nil {
+				log.Printf("Error iterating linked documents: %v", err)
+			}
+		} else {
+			log.Printf("Failed to query linked documents: %v", err)
 		}
 
 		c.JSON(http.StatusOK, gin.H{
@@ -1611,6 +3170,26 @@ func handleRCAGenerate(dbPool *pgxpool.Pool, aiServiceURL string) gin.HandlerFun
 		if !requirePlantAccess(c, dbPool, req.PlantID) {
 			return
 		}
+		req.OrganizationID = c.GetString("orgID")
+
+		// Verify asset exists in this plant and org before generating RCA
+		var assetExists bool
+		checkErr := dbPool.QueryRow(c.Request.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM asset.assets
+				WHERE UPPER(asset_tag) = UPPER($1)
+				  AND organization_id = $2
+				  AND plant_id = $3
+			)
+		`, req.AssetTag, req.OrganizationID, req.PlantID).Scan(&assetExists)
+		if checkErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify asset"})
+			return
+		}
+		if !assetExists {
+			c.JSON(http.StatusNotFound, gin.H{"error": "asset not found in the specified plant"})
+			return
+		}
 
 		payloadBytes, err := json.Marshal(req)
 		if err != nil {
@@ -1618,24 +3197,21 @@ func handleRCAGenerate(dbPool *pgxpool.Pool, aiServiceURL string) gin.HandlerFun
 			return
 		}
 
-		resp, err := http.Post(
-			fmt.Sprintf("%s/rca", aiServiceURL),
-			"application/json",
-			strings.NewReader(string(payloadBytes)),
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to AI service: %v", err)})
-			return
-		}
-		defer resp.Body.Close()
+		recordAuditEvent(c, dbPool, req.PlantID, "RCA_GENERATION_REQUESTED", "asset", req.AssetTag, map[string]interface{}{
+			"failureDescriptionChars": len(req.FailureDescription),
+		})
 
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read AI service response: %v", err)})
+		aiResp, err := callAIService(c.Request.Context(), http.MethodPost, aiServiceURL, "/rca", payloadBytes)
+		if err != nil || aiResp.StatusCode < 200 || aiResp.StatusCode >= 300 {
+			reason := aiFailureReason(err, aiResp)
+			recordAuditEvent(c, dbPool, req.PlantID, "RCA_GENERATION_FALLBACK", "asset", req.AssetTag, map[string]interface{}{
+				"reason": reason,
+			})
+			c.JSON(http.StatusOK, fallbackRCAResponse(req.AssetTag, reason))
 			return
 		}
 
-		c.Data(resp.StatusCode, "application/json", respBody)
+		c.Data(aiResp.StatusCode, "application/json", aiResp.Body)
 	}
 }
 
@@ -1713,27 +3289,25 @@ func handleComplianceScan(dbPool *pgxpool.Pool, aiServiceURL string) gin.Handler
 			return
 		}
 
-		target := fmt.Sprintf("%s/compliance?plantId=%s", strings.TrimRight(aiServiceURL, "/"), url.QueryEscape(plantID))
-		req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, target, nil)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to prepare compliance scan request: %v", err)})
+		recordAuditEvent(c, dbPool, plantID, "COMPLIANCE_SCAN_REQUESTED", "plant", plantID, nil)
+
+		aiPath := fmt.Sprintf("/compliance?plantId=%s", url.QueryEscape(plantID))
+		aiResp, err := callAIService(c.Request.Context(), http.MethodGet, aiServiceURL, aiPath, nil)
+		if err != nil || aiResp.StatusCode < 200 || aiResp.StatusCode >= 300 {
+			reason := aiFailureReason(err, aiResp)
+			recordAuditEvent(c, dbPool, plantID, "COMPLIANCE_SCAN_FALLBACK", "plant", plantID, map[string]interface{}{
+				"reason": reason,
+			})
+			c.JSON(http.StatusOK, gin.H{
+				"status":      "DEGRADED",
+				"fallback":    true,
+				"gaps":        []gin.H{},
+				"missingInfo": []string{"AI service unavailable or timed out; compliance scan did not complete", reason},
+			})
 			return
 		}
 
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to AI service: %v", err)})
-			return
-		}
-		defer resp.Body.Close()
-
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read AI service response: %v", err)})
-			return
-		}
-
-		c.Data(resp.StatusCode, "application/json", respBody)
+		c.Data(aiResp.StatusCode, "application/json", aiResp.Body)
 	}
 }
 
@@ -1748,16 +3322,23 @@ func handleGetGraph(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		if plantID != "" && !requirePlantAccess(c, dbPool, plantID) {
 			return
 		}
+		sourcePolicy := documentSourcePolicyForRole(c.GetString("role"))
 
 		nodes := []gin.H{}
 		nodeRows, err := dbPool.Query(c.Request.Context(), `
-			SELECT id::text, entity_type, entity_value, COALESCE(normalized_value, ''), confidence, document_id::text, page_no
-			FROM graph.entities
-			WHERE organization_id = $1
-			  AND ($2::uuid IS NULL OR plant_id = $2::uuid)
-			ORDER BY created_at DESC
+			SELECT e.id::text, e.entity_type, e.entity_value, COALESCE(e.normalized_value, ''), e.confidence, e.document_id::text, e.page_no
+			FROM graph.entities e
+			LEFT JOIN document.documents d ON e.document_id = d.id
+			WHERE e.organization_id = $1
+			  AND ($2::uuid IS NULL OR e.plant_id = $2::uuid)
+			  AND (
+			    e.document_id IS NULL
+			    OR COALESCE(d.access_level, 'internal') = ANY($3)
+			    OR COALESCE(d.allowed_roles, ARRAY[]::text[]) && $4
+			  )
+			ORDER BY e.created_at DESC
 			LIMIT 300
-		`, orgID, nullableUUID(plantID))
+		`, orgID, nullableUUID(plantID), sourcePolicy.ReadableAccessLevels, sourcePolicy.AllowedRoles)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to load graph nodes: %v", err)})
 			return
@@ -1796,11 +3377,17 @@ func handleGetGraph(dbPool *pgxpool.Pool) gin.HandlerFunc {
 			FROM graph.relationships r
 			JOIN graph.entities s ON r.source_entity_id = s.id
 			JOIN graph.entities t ON r.target_entity_id = t.id
+			LEFT JOIN document.documents d ON r.evidence_document_id = d.id
 			WHERE r.organization_id = $1
 			  AND ($2::uuid IS NULL OR s.plant_id = $2::uuid OR t.plant_id = $2::uuid)
+			  AND (
+			    r.evidence_document_id IS NULL
+			    OR COALESCE(d.access_level, 'internal') = ANY($3)
+			    OR COALESCE(d.allowed_roles, ARRAY[]::text[]) && $4
+			  )
 			ORDER BY r.created_at DESC
 			LIMIT 500
-		`, orgID, nullableUUID(plantID))
+		`, orgID, nullableUUID(plantID), sourcePolicy.ReadableAccessLevels, sourcePolicy.AllowedRoles)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to load graph edges: %v", err)})
 			return

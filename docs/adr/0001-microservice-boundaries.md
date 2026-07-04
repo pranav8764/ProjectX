@@ -24,5 +24,5 @@ Do not recreate empty per-domain service folders. A future split must introduce 
 - The MVP stays easier to run and demo.
 - Teams still have clear ownership through schemas and logical modules.
 - Contract changes must be documented in the consolidated OpenAPI files first.
-- Legacy per-domain OpenAPI files remain planning sketches only.
+- Split-service OpenAPI files should not be reintroduced unless the split is implemented as a real service in the same change.
 - A future service split is possible without pretending the split exists today.

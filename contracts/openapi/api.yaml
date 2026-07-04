@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: PlantBrainAI Consolidated API
   version: 0.1.0
-  description: Public Go API/BFF implemented by services/api for the consolidated MVP runtime.
+  description: Public Go API/BFF implemented by services/api for the consolidated MVP runtime. All /api routes require an authenticated session token or cookie and enforce plant membership; selected routes also enforce role gates.
 servers:
   - url: http://localhost:8080
 security:
@@ -23,6 +23,7 @@ paths:
     get:
       summary: Get authenticated user context
       tags: [Auth]
+      x-rbac: Any authenticated user
       responses:
         "200":
           description: Current user context
@@ -36,6 +37,8 @@ paths:
     get:
       summary: List documents
       tags: [Documents]
+      description: Returns document metadata visible in the caller's plant scope, including access metadata that clients use to distinguish metadata visibility from original-source download permission.
+      x-rbac: Any authenticated user in the requested plant scope
       parameters:
         - $ref: "#/components/parameters/PlantIdQuery"
       responses:
@@ -47,10 +50,16 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/DocumentSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /api/documents/{id}:
     get:
       summary: Get document detail
       tags: [Documents]
+      description: Returns document metadata and derived extraction artifacts. Restricted or confidential source files still require the caller to satisfy the document's source access policy before download.
+      x-rbac: Any authenticated user with plant access
       parameters:
         - $ref: "#/components/parameters/IdPath"
       responses:
@@ -59,13 +68,17 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: "#/components/schemas/DocumentDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
     delete:
       summary: Archive a document
       tags: [Documents]
+      x-rbac: [admin, engineer]
       parameters:
         - $ref: "#/components/parameters/IdPath"
       responses:
@@ -74,7 +87,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/MessageResponse"
+                $ref: "#/components/schemas/DocumentArchiveResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -83,6 +98,7 @@ paths:
     get:
       summary: Get document processing status
       tags: [Documents]
+      x-rbac: Any authenticated user with plant access
       parameters:
         - $ref: "#/components/parameters/IdPath"
       responses:
@@ -92,12 +108,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DocumentStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
   /api/documents/{id}/download:
     get:
       summary: Create a short-lived signed URL for the original document file
       tags: [Documents]
+      description: Returns a MinIO/S3 presigned URL for the original upload when the caller has plant access and satisfies the document's accessLevel/allowedRoles source policy. The URL expires after 600 seconds.
+      x-rbac: Plant access plus document source-download policy
       parameters:
         - $ref: "#/components/parameters/IdPath"
       responses:
@@ -107,12 +129,96 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DocumentDownloadResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+  /api/documents/{id}/retry-processing:
+    post:
+      summary: Retry AI processing for an uploaded document
+      tags: [Documents]
+      description: Requeues the current document version and asks the AI service to process the shared upload file again. If processing is already active, the API returns 409.
+      x-rbac: [admin, engineer]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "202":
+          description: Processing retry queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentProcessingRetryResponse"
+        "200":
+          description: Retry was attempted but the AI service did not accept the job
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentProcessingRetryResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /api/documents/{id}/versions:
+    post:
+      summary: Upload a newer source version for an existing document
+      tags: [Documents]
+      description: Adds a new document version, makes it the current version, clears stale extracted evidence for the previous version, and queues AI processing for the new source.
+      x-rbac: Plant access plus document source-download policy
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                title:
+                  type: string
+                  description: Optional replacement title.
+                versionLabel:
+                  type: string
+                  description: Optional label such as v2. Defaults to the next numeric vN label.
+      responses:
+        "202":
+          description: Version uploaded and queued for processing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentVersionUploadResponse"
+        "200":
+          description: Duplicate version detected or AI processing failed after upload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentVersionUploadResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /api/documents/upload:
     post:
       summary: Upload a document and trigger AI processing
       tags: [Documents]
+      x-rbac: Any authenticated user in the requested plant scope
       requestBody:
         required: true
         content:
@@ -138,10 +244,15 @@ paths:
                 $ref: "#/components/schemas/DocumentUploadResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /api/copilot/query:
     post:
       summary: Ask the RAG copilot
       tags: [Copilot]
+      x-rbac: Any authenticated user in the requested plant scope
       requestBody:
         required: true
         content:
@@ -157,10 +268,15 @@ paths:
                 $ref: "#/components/schemas/CopilotQueryResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /api/dashboard/metrics:
     get:
       summary: Get dashboard metrics
       tags: [Dashboard]
+      x-rbac: [admin, plant_manager, engineer, compliance_officer]
       parameters:
         - $ref: "#/components/parameters/PlantIdQuery"
       responses:
@@ -169,14 +285,16 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: "#/components/schemas/DashboardMetrics"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
   /api/assets:
     get:
       summary: List assets
       tags: [Assets]
+      x-rbac: Any authenticated user in the requested plant scope
       parameters:
         - $ref: "#/components/parameters/PlantIdQuery"
       responses:
@@ -188,10 +306,15 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Asset"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /api/assets/{id}:
     get:
       summary: Get asset profile by id or asset tag
       tags: [Assets]
+      x-rbac: Any authenticated user with plant access
       parameters:
         - $ref: "#/components/parameters/IdPath"
       responses:
@@ -201,12 +324,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssetProfile"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
   /api/rca/generate:
     post:
       summary: Generate RCA for an asset
       tags: [RCA]
+      x-rbac: [admin, plant_manager, engineer]
       requestBody:
         required: true
         content:
@@ -222,12 +350,15 @@ paths:
                 $ref: "#/components/schemas/RcaResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
   /api/compliance/gaps:
     get:
       summary: List compliance gaps
       tags: [Compliance]
+      x-rbac: [admin, plant_manager, engineer, compliance_officer]
       parameters:
         - $ref: "#/components/parameters/PlantIdQuery"
       responses:
@@ -241,10 +372,13 @@ paths:
                   $ref: "#/components/schemas/ComplianceGap"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
   /api/compliance/scan:
     post:
       summary: Run a compliance scan for a plant
       tags: [Compliance]
+      x-rbac: [admin, plant_manager, compliance_officer]
       parameters:
         - name: plantId
           in: query
@@ -261,14 +395,18 @@ paths:
               schema:
                 type: array
                 items:
-                  type: object
-                  additionalProperties: true
+                  $ref: "#/components/schemas/ComplianceScanGap"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
   /api/graph:
     get:
       summary: Get graph entities and relationships
       tags: [Graph]
+      x-rbac: Any authenticated user in the requested plant scope
       parameters:
         - $ref: "#/components/parameters/PlantIdQuery"
       responses:
@@ -277,22 +415,18 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  nodes:
-                    type: array
-                    items:
-                      type: object
-                      additionalProperties: true
-                  edges:
-                    type: array
-                    items:
-                      type: object
-                      additionalProperties: true
+                $ref: "#/components/schemas/GraphResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /api/reports:
     get:
       summary: List report jobs
       tags: [Reports]
+      x-rbac: [admin, plant_manager, engineer, compliance_officer]
+      parameters:
+        - $ref: "#/components/parameters/PlantIdQuery"
       responses:
         "200":
           description: Report jobs
@@ -304,9 +438,13 @@ paths:
                   $ref: "#/components/schemas/ReportJob"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
     post:
       summary: Create a CSV, PDF, or DOCX report job
       tags: [Reports]
+      description: The MVP generates the report synchronously, stores it under the API uploads volume, and returns a download route when rendering succeeds.
+      x-rbac: [admin, plant_manager, engineer, compliance_officer]
       requestBody:
         required: true
         content:
@@ -322,12 +460,15 @@ paths:
                 $ref: "#/components/schemas/ReportJobCreated"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
   /api/reports/{id}/download:
     get:
       summary: Download a completed report
       tags: [Reports]
+      x-rbac: [admin, plant_manager, engineer, compliance_officer]
       parameters:
         - $ref: "#/components/parameters/IdPath"
       responses:
@@ -347,6 +488,8 @@ paths:
                 format: binary
         "403":
           $ref: "#/components/responses/Forbidden"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
 components:
@@ -394,6 +537,18 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    Gone:
+      description: Resource is archived or no longer downloadable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: Request conflicts with the current resource state
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
   schemas:
     HealthResponse:
       type: object
@@ -416,6 +571,49 @@ components:
       properties:
         message:
           type: string
+    RoleKey:
+      type: string
+      enum:
+        - admin
+        - plant_manager
+        - engineer
+        - technician
+        - compliance_officer
+        - viewer
+    DocumentAccessLevel:
+      type: string
+      description: Metadata visibility and source-download policy bucket for a document.
+      enum:
+        - public
+        - internal
+        - restricted
+        - confidential
+    DocumentSensitivity:
+      type: string
+      description: Business sensitivity label used by clients and policy checks.
+      enum:
+        - standard
+        - sensitive
+        - confidential
+        - safety_critical
+    DocumentAccessFields:
+      type: object
+      properties:
+        accessLevel:
+          $ref: "#/components/schemas/DocumentAccessLevel"
+        sensitivity:
+          $ref: "#/components/schemas/DocumentSensitivity"
+        allowedRoles:
+          type: array
+          description: Roles that may download the original source evidence for this document. Metadata may still be visible to broader plant-scoped users.
+          items:
+            $ref: "#/components/schemas/RoleKey"
+        sourceRestricted:
+          type: boolean
+          description: True when the source file is governed by a stricter policy than ordinary document metadata.
+        sourceDownloadAllowed:
+          type: boolean
+          description: Whether the current caller may request /api/documents/{id}/download for this document.
     CurrentUser:
       type: object
       required: [userId, orgId, plantId, role]
@@ -427,27 +625,58 @@ components:
         plantId:
           type: string
         role:
-          type: string
+          $ref: "#/components/schemas/RoleKey"
     DocumentSummary:
-      type: object
-      properties:
-        id:
-          type: string
-        title:
-          type: string
-        fileType:
-          type: string
-        documentType:
-          type: string
-        status:
-          $ref: "#/components/schemas/DocumentStatus"
-        ocrConfidence:
-          type: number
-        classificationConfidence:
-          type: number
-        createdAt:
-          type: string
-          format: date-time
+      allOf:
+        - $ref: "#/components/schemas/DocumentAccessFields"
+        - type: object
+          required: [id, title, fileType, documentType, status, ocrConfidence, classificationConfidence, createdAt]
+          properties:
+            id:
+              type: string
+            title:
+              type: string
+            fileType:
+              type: string
+            documentType:
+              type: string
+            status:
+              $ref: "#/components/schemas/DocumentStatus"
+            ocrConfidence:
+              type: number
+            classificationConfidence:
+              type: number
+            createdAt:
+              type: string
+              format: date-time
+            processingJobId:
+              type: string
+              nullable: true
+            processingStatus:
+              type: string
+              nullable: true
+              description: Latest ingestion job status when a job has been created.
+            processingProgress:
+              type: number
+              nullable: true
+              description: Latest processing progress percentage from 0 to 100.
+            processingAttempts:
+              type: integer
+              nullable: true
+              description: Number of times the current processing job has been queued or retried.
+            retryAvailable:
+              type: boolean
+              description: True when the caller can retry the current failed or partial processing job.
+            retryUrl:
+              type: string
+              nullable: true
+            processingError:
+              type: string
+              nullable: true
+            jobUpdatedAt:
+              type: string
+              format: date-time
+              nullable: true
     DocumentStatus:
       type: string
       enum:
@@ -469,11 +698,175 @@ components:
         - ARCHIVED
     DocumentStatusResponse:
       type: object
+      required: [documentId, plantId, status, updatedAt, processingProgress]
+      properties:
+        documentId:
+          type: string
+        plantId:
+          type: string
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        currentVersionId:
+          type: string
+        updatedAt:
+          type: string
+          format: date-time
+        processingJobId:
+          type: string
+        processingStatus:
+          type: string
+        processingProgress:
+          type: number
+        processingAttempts:
+          type: integer
+        attempts:
+          type: integer
+          description: Backward-compatible alias for processingAttempts.
+        retryAvailable:
+          type: boolean
+        retryUrl:
+          type: string
+        errorMessage:
+          type: string
+        lastAttemptedAt:
+          type: string
+          format: date-time
+        nextRetryAt:
+          type: string
+          format: date-time
+        lockedAt:
+          type: string
+          format: date-time
+        lockedBy:
+          type: string
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+        jobUpdatedAt:
+          type: string
+          format: date-time
+    DocumentDetail:
+      allOf:
+        - $ref: "#/components/schemas/DocumentAccessFields"
+        - type: object
+          required: [id, organizationId, plantId, title, documentType, status, createdAt, updatedAt, currentVersion, pages, chunks, entities]
+          properties:
+            id:
+              type: string
+            organizationId:
+              type: string
+            plantId:
+              type: string
+            title:
+              type: string
+            documentType:
+              type: string
+            status:
+              $ref: "#/components/schemas/DocumentStatus"
+            uploadedBy:
+              type: string
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+            currentVersion:
+              $ref: "#/components/schemas/DocumentVersion"
+            pages:
+              type: array
+              items:
+                $ref: "#/components/schemas/DocumentPage"
+            chunks:
+              type: array
+              description: Limited to the first 50 chunks in the current API response. Access-controlled deployments may omit or redact chunks that the current caller cannot use as evidence.
+              items:
+                $ref: "#/components/schemas/DocumentChunk"
+            entities:
+              type: array
+              description: Limited to the top 100 entities by confidence in the current API response.
+              items:
+                $ref: "#/components/schemas/DocumentEntity"
+    DocumentVersion:
+      type: object
+      properties:
+        id:
+          type: string
+        versionLabel:
+          type: string
+        fileUrl:
+          type: string
+          description: Internal object-storage URL. Use /api/documents/{id}/download for a signed download URL.
+        fileType:
+          type: string
+        fileSha256:
+          type: string
+        markdownContent:
+          type: string
+        ocrConfidence:
+          type: number
+        classificationConfidence:
+          type: number
+        createdAt:
+          type: string
+          format: date-time
+    DocumentPage:
+      type: object
+      properties:
+        pageNo:
+          type: integer
+        rawText:
+          type: string
+        markdownText:
+          type: string
+        ocrConfidence:
+          type: number
+        metadata:
+          type: object
+          additionalProperties: true
+    DocumentChunk:
+      type: object
+      properties:
+        id:
+          type: string
+        pageNo:
+          type: integer
+        chunkIndex:
+          type: integer
+        text:
+          type: string
+        tokenCount:
+          type: integer
+        metadata:
+          type: object
+          additionalProperties: true
+    DocumentEntity:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        value:
+          type: string
+        normalizedValue:
+          type: string
+        confidence:
+          type: number
+        pageNo:
+          type: integer
+    DocumentArchiveResponse:
+      type: object
+      required: [documentId, status, message]
       properties:
         documentId:
           type: string
         status:
-          $ref: "#/components/schemas/DocumentStatus"
+          type: string
+          enum: [ARCHIVED]
         message:
           type: string
     DocumentUploadResponse:
@@ -488,12 +881,26 @@ components:
           type: boolean
         message:
           type: string
+        processingStatus:
+          type: string
+        processingProgress:
+          type: number
+        processingAttempts:
+          type: integer
+        retryAvailable:
+          type: boolean
+        retryUrl:
+          type: string
     DocumentDownloadResponse:
       type: object
       required: [documentId, downloadUrl, expiresAt, expiresInSec]
       properties:
         documentId:
           type: string
+        accessLevel:
+          $ref: "#/components/schemas/DocumentAccessLevel"
+        sensitivity:
+          $ref: "#/components/schemas/DocumentSensitivity"
         downloadUrl:
           type: string
           format: uri
@@ -502,6 +909,96 @@ components:
           format: date-time
         expiresInSec:
           type: integer
+          example: 600
+    DocumentProcessingRetryResponse:
+      type: object
+      required: [documentId, status, message]
+      properties:
+        documentId:
+          type: string
+        status:
+          type: string
+          enum:
+            - QUEUED
+            - FAILED
+        processingStatus:
+          type: string
+        retryAvailable:
+          type: boolean
+        retryUrl:
+          type: string
+        processingAttempts:
+          type: integer
+        processingProgress:
+          type: number
+        message:
+          type: string
+    DocumentVersionUploadResponse:
+      type: object
+      required: [documentId, status, message]
+      properties:
+        documentId:
+          type: string
+        versionId:
+          type: string
+        versionLabel:
+          type: string
+        status:
+          type: string
+        duplicate:
+          type: boolean
+        processingStatus:
+          type: string
+        processingProgress:
+          type: number
+        retryAvailable:
+          type: boolean
+        retryUrl:
+          type: string
+        processingAttempts:
+          type: integer
+        message:
+          type: string
+    DashboardMetrics:
+      type: object
+      properties:
+        totalDocuments:
+          type: integer
+        documentsProcessed:
+          type: integer
+        documentsFailed:
+          type: integer
+        assetsDiscovered:
+          type: integer
+        criticalAssets:
+          type: integer
+        repeatedFailures:
+          type: integer
+        complianceGaps:
+          type: integer
+        querySuccessRate:
+          type: number
+        averageQueryConfidence:
+          type: number
+        knowledgeGraphRelationships:
+          type: integer
+        knowledgeGraphCompleteness:
+          type: number
+        timeSavedEstimateMinutes:
+          type: integer
+        documentProcessingStatus:
+          type: object
+          additionalProperties:
+            type: integer
+        processingQueueDepth:
+          type: integer
+          description: Count of active queued or running ingestion jobs.
+        processingRetryableDocuments:
+          type: integer
+          description: Count of documents with failed or partial jobs eligible for retry.
+        processingAttempts:
+          type: integer
+          description: Sum of recorded ingestion job attempts in the current metrics scope.
     CopilotQueryRequest:
       type: object
       required: [question]
@@ -523,7 +1020,7 @@ components:
                 type: string
     CopilotQueryResponse:
       type: object
-      required: [answer, confidence, citations]
+      required: [answer, confidence, citations, relatedAssets, missingInfo]
       properties:
         answer:
           type: string
@@ -550,6 +1047,13 @@ components:
           type: string
         documentTitle:
           type: string
+        accessLevel:
+          $ref: "#/components/schemas/DocumentAccessLevel"
+        sensitivity:
+          $ref: "#/components/schemas/DocumentSensitivity"
+        sourceDownloadAllowed:
+          type: boolean
+          description: Whether the current caller may open the original source document behind this citation.
         page:
           type: integer
         snippet:
@@ -599,19 +1103,21 @@ components:
               items:
                 $ref: "#/components/schemas/ComplianceGap"
     LinkedDocument:
-      type: object
-      properties:
-        id:
-          type: string
-        title:
-          type: string
-        documentType:
-          type: string
-        status:
-          $ref: "#/components/schemas/DocumentStatus"
-        createdAt:
-          type: string
-          format: date-time
+      allOf:
+        - $ref: "#/components/schemas/DocumentAccessFields"
+        - type: object
+          properties:
+            id:
+              type: string
+            title:
+              type: string
+            documentType:
+              type: string
+            status:
+              $ref: "#/components/schemas/DocumentStatus"
+            createdAt:
+              type: string
+              format: date-time
     RcaGenerateRequest:
       type: object
       required: [assetTag, failureDescription]
@@ -625,6 +1131,7 @@ components:
           format: uuid
     RcaResponse:
       type: object
+      required: [summary, probableCauses, recommendations, confidence, citations]
       properties:
         summary:
           type: string
@@ -699,6 +1206,70 @@ components:
         updatedAt:
           type: string
           format: date-time
+    ComplianceScanGap:
+      type: object
+      properties:
+        assetTag:
+          type: string
+        gapType:
+          type: string
+          enum: [MISSING_EVIDENCE, EXPIRED_CERTIFICATE]
+        description:
+          type: string
+        severity:
+          type: string
+        status:
+          type: string
+        standard:
+          type: string
+    GraphResponse:
+      type: object
+      required: [plantId, nodes, edges]
+      properties:
+        plantId:
+          type: string
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphNode"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphEdge"
+    GraphNode:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        label:
+          type: string
+        normalizedValue:
+          type: string
+        confidence:
+          type: number
+        documentId:
+          type: string
+        pageNo:
+          type: integer
+    GraphEdge:
+      type: object
+      properties:
+        id:
+          type: string
+        source:
+          type: string
+        target:
+          type: string
+        type:
+          type: string
+        confidence:
+          type: number
+        evidenceDocumentId:
+          type: string
+        evidenceChunkId:
+          type: string
     ReportJobRequest:
       type: object
       required: [reportType]
@@ -716,6 +1287,7 @@ components:
             - query_answers
         format:
           type: string
+          description: Top-level report format. If omitted, the API also accepts parameters.format before defaulting to csv.
           default: csv
           enum:
             - csv
@@ -733,6 +1305,7 @@ components:
           type: string
         format:
           type: string
+          description: Present on create responses. List responses do not currently persist report format separately.
         status:
           type: string
         createdAt:

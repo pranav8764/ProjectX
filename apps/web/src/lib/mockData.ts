@@ -13,6 +13,11 @@ export interface Document {
   version?: string;
   assetTags?: string[];
   uploadedBy?: string;
+  accessLevel?: string | null;
+  sensitivity?: string | null;
+  allowedRoles?: string[] | null;
+  sourceRestricted?: boolean | null;
+  sourceDownloadAllowed?: boolean | null;
 }
 
 export interface FailureEvent {

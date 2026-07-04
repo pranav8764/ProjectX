@@ -18,8 +18,11 @@ import {
   Settings,
   Menu,
   X,
+  Lock,
+  AlertTriangle,
 } from 'lucide-react';
-import { clearStoredSession, getStoredSession, PlantBrainSession } from '../lib/api';
+import { API_FORBIDDEN_EVENT, clearStoredSession, getStoredSession, PlantBrainSession } from '../lib/api';
+import { canAccessPath, getDeniedMessage, getRoleLabel, getRouteAction } from '../lib/permissions';
 
 interface NavigationShellProps {
   children: React.ReactNode;
@@ -43,6 +46,7 @@ export default function NavigationShell({ children }: NavigationShellProps) {
   const [user, setUser] = useState<PlantBrainSession | null>(null);
   const [loading, setLoading] = useState(true);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [accessNotice, setAccessNotice] = useState('');
 
   useEffect(() => {
     const session = getStoredSession();
@@ -59,6 +63,17 @@ export default function NavigationShell({ children }: NavigationShellProps) {
   useEffect(() => {
     setMobileOpen(false);
   }, [pathname]);
+
+  useEffect(() => {
+    const handleForbidden = (event: Event) => {
+      const detail = (event as CustomEvent<{ method?: string; path?: string }>).detail;
+      const target = detail?.path ? ` ${detail.path}` : '';
+      setAccessNotice(`Your current role cannot access${target}.`);
+    };
+
+    window.addEventListener(API_FORBIDDEN_EVENT, handleForbidden);
+    return () => window.removeEventListener(API_FORBIDDEN_EVENT, handleForbidden);
+  }, []);
 
   const handleLogout = () => {
     clearStoredSession();
@@ -122,6 +137,25 @@ export default function NavigationShell({ children }: NavigationShellProps) {
             {navItems.map((item) => {
               const Icon = item.icon;
               const isActive = pathname === item.href || (item.href !== '/' && pathname.startsWith(item.href));
+              const isAllowed = canAccessPath(user.role, item.href);
+              const deniedReason = getDeniedMessage(user.role, getRouteAction(item.href));
+
+              if (!isAllowed) {
+                return (
+                  <button
+                    key={item.href}
+                    type="button"
+                    disabled
+                    title={deniedReason}
+                    className="w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium text-slate-600 border border-transparent cursor-not-allowed"
+                  >
+                    <Icon className="w-4 h-4 text-slate-700" />
+                    <span className="truncate">{item.name}</span>
+                    <Lock className="w-3.5 h-3.5 ml-auto text-slate-700" />
+                  </button>
+                );
+              }
+
               return (
                 <Link
                   key={item.href}
@@ -147,7 +181,7 @@ export default function NavigationShell({ children }: NavigationShellProps) {
             </div>
             <div className="flex-1 min-w-0">
               <p className="text-xs font-semibold text-slate-200 truncate">{user.name}</p>
-              <p className="text-[10px] text-slate-500 truncate uppercase font-mono">{user.role}</p>
+              <p className="text-[10px] text-slate-500 truncate uppercase font-mono">{getRoleLabel(user.role)}</p>
               {user.plantName && <p className="text-[10px] text-slate-600 truncate font-mono">{user.plantName}</p>}
             </div>
             <button
@@ -186,11 +220,28 @@ export default function NavigationShell({ children }: NavigationShellProps) {
             <div className="hidden md:block h-4 w-px bg-slate-800" />
             <div className="hidden md:block">
               <span>
-                Role: <span className="text-slate-300">{user.role}</span>
+                Role: <span className="text-slate-300">{getRoleLabel(user.role)}</span>
               </span>
             </div>
           </div>
         </header>
+
+        {accessNotice && (
+          <div className="mx-4 sm:mx-6 lg:mx-8 mt-4 p-3 rounded-xl border border-cyber-amber/20 bg-cyber-amber/5 text-amber-200 text-xs flex items-start justify-between gap-3">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-cyber-amber shrink-0 mt-0.5" />
+              <span>{accessNotice}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAccessNotice('')}
+              className="text-amber-200/70 hover:text-amber-100"
+              aria-label="Dismiss access notice"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
 
         <div className="p-4 sm:p-6 lg:p-8 flex-1 max-w-[1600px] w-full mx-auto">{children}</div>
       </main>

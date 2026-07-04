@@ -280,7 +280,7 @@ class TestMockIntegration(unittest.TestCase):
         
         # Seed fetchrow results for document version lookups
         self.conn.fetchrow_results = {
-            "SELECT id FROM document.document_versions": {"id": version_id},
+            "COALESCE(d.current_version_id": {"id": version_id},
             "SELECT organization_id, plant_id": {"organization_id": uuid.uuid4(), "plant_id": uuid.uuid4()}
         }
         
@@ -299,10 +299,6 @@ class TestMockIntegration(unittest.TestCase):
             # Inspect that we saved outputs in document_versions, document_pages, document_chunks, and entities
             queries = [q[0] for q in self.conn.executed_queries]
             
-            # Verify status update to COMPLETED
-            self.assertTrue(any("UPDATE document.documents" in q and "COMPLETED" in str(q) for q in queries) or 
-                            any("status = 'COMPLETED'" in q for q in queries))
-            
             # Verify database saving inserts
             self.assertTrue(any("INSERT INTO ingestion.document_pages" in q for q in queries))
             self.assertTrue(any("INSERT INTO ingestion.document_chunks" in q for q in queries))
@@ -310,6 +306,61 @@ class TestMockIntegration(unittest.TestCase):
             
             # Verify assets registering for EQUIPMENT_TAG
             self.assertTrue(any("INSERT INTO asset.assets" in q for q in queries))
+
+            # Verify processing job writes are pinned to the resolved current version.
+            processing_writes = [
+                args for query, args in self.conn.executed_queries
+                if "INSERT INTO ingestion.processing_jobs" in query
+            ]
+            self.assertTrue(processing_writes)
+            self.assertTrue(all(args[1] == version_id for args in processing_writes))
+            self.assertEqual(processing_writes[0][2], "EXTRACTING_TEXT")
+            self.assertTrue(processing_writes[0][5])
+            self.assertEqual(processing_writes[-1][2], "COMPLETED")
+            self.assertTrue(processing_writes[-1][6])
+
+            document_status_updates = [
+                args for query, args in self.conn.executed_queries
+                if "UPDATE document.documents" in query
+            ]
+            self.assertEqual(document_status_updates[-1][0], "COMPLETED")
+            self.assertEqual(document_status_updates[-1][2], version_id)
+
+    def test_ingestion_pipeline_partial_success_for_empty_extraction(self):
+        """Empty extraction persists version results but ends as PARTIAL_SUCCESS with missing-data reason"""
+        doc_id = str(uuid.uuid4())
+        version_id = uuid.uuid4()
+
+        self.conn.fetchrow_results = {
+            "COALESCE(d.current_version_id": {"id": version_id},
+            "SELECT organization_id, plant_id": {"organization_id": uuid.uuid4(), "plant_id": uuid.uuid4()}
+        }
+
+        with patch('services.ai.app.main.extract_generic_text', return_value=""), \
+             patch('services.ai.app.main.extract_tables', return_value=[]):
+            asyncio.run(self.main.run_ingestion_pipeline(
+                document_id=doc_id,
+                file_path="empty.txt",
+                file_type="txt",
+                metadata={"title": "Empty manual retry"}
+            ))
+
+        processing_writes = [
+            args for query, args in self.conn.executed_queries
+            if "INSERT INTO ingestion.processing_jobs" in query
+        ]
+        self.assertTrue(processing_writes)
+        self.assertEqual(processing_writes[-1][2], "FAILED")
+        self.assertIn("Corrupt or empty document", processing_writes[-1][3])
+        self.assertEqual(processing_writes[-1][4], 0.0)
+        self.assertTrue(processing_writes[-1][6])
+
+        document_status_updates = [
+            args for query, args in self.conn.executed_queries
+            if "UPDATE document.documents" in query
+        ]
+        self.assertEqual(document_status_updates[-1][0], "FAILED")
+        self.assertEqual(document_status_updates[-1][2], version_id)
 
     def test_rag_query_with_citations(self):
         """Test RAG query synthesis and citation parsing"""
@@ -364,6 +415,72 @@ class TestMockIntegration(unittest.TestCase):
         
         # Check assets list extraction
         self.assertIn("P-101", response["relatedAssets"])
+
+    def test_rag_query_excludes_restricted_documents_for_role(self):
+        """Test RAG retrieval excludes sources the current user role cannot access"""
+        plant_id = str(uuid.uuid4())
+        org_id = uuid.uuid4()
+        user_id = str(uuid.uuid4())
+        open_doc_id = uuid.uuid4()
+        restricted_doc_id = uuid.uuid4()
+        captured_prompt = {}
+
+        self.conn.fetch_results = {
+            "information_schema.columns": [
+                {"column_name": "access_level"},
+                {"column_name": "allowed_roles"},
+            ],
+            "SELECT c.id": [
+                {
+                    "id": uuid.uuid4(),
+                    "document_id": open_doc_id,
+                    "page_no": 1,
+                    "chunk_text": "Pump inspection notes are available for routine maintenance.",
+                    "title": "Open Maintenance Log",
+                    "distance": 0.1,
+                    "access_level": "public",
+                    "allowed_roles": None,
+                },
+                {
+                    "id": uuid.uuid4(),
+                    "document_id": restricted_doc_id,
+                    "page_no": 3,
+                    "chunk_text": "Confidential root cause details must not be exposed to technicians.",
+                    "title": "Restricted Compliance Finding",
+                    "distance": 0.12,
+                    "access_level": "restricted",
+                    "allowed_roles": ["admin", "compliance_officer"],
+                },
+            ],
+        }
+        self.conn.fetchrow_results = {
+            "SELECT organization_id": {"organization_id": org_id},
+            "SELECT r.name AS role": {"role": "Field Technician"},
+        }
+
+        async def fake_generate(prompt):
+            captured_prompt["text"] = prompt
+            return """
+ANSWER: Routine maintenance notes are available [1].
+CONFIDENCE: 0.80
+MISSING_INFO: none
+"""
+
+        req = self.main.CopilotQueryRequest(
+            question="What maintenance notes are available?",
+            plantId=plant_id,
+            userId=user_id,
+            organizationId=str(org_id),
+        )
+
+        with patch("services.ai.app.main.generate_text_llm", side_effect=fake_generate):
+            response = asyncio.run(self.main.rag_query(req))
+
+        self.assertEqual(len(response["citations"]), 1)
+        self.assertEqual(response["citations"][0]["documentId"], str(open_doc_id))
+        self.assertEqual(response["citations"][0]["documentTitle"], "Open Maintenance Log")
+        self.assertNotIn("Restricted Compliance Finding", captured_prompt["text"])
+        self.assertNotIn("Confidential root cause", captured_prompt["text"])
 
     def test_rca_generation(self):
         """Test Root Cause Analysis report generation"""

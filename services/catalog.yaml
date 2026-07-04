@@ -26,8 +26,3 @@ services:
       - rca
       - compliance
       - ai
-legacy_contracts:
-  location:
-    - contracts/openapi/
-  status: planning_sketch_only
-  note: Older domain-level OpenAPI sketches describe possible future splits and are not runnable service folders in the MVP.

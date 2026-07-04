@@ -179,12 +179,22 @@ components:
         plantId:
           type: string
           format: uuid
+        userId:
+          type: string
+          description: Forwarded by services/api for audit/context; ignored by the current AI handler.
+        organizationId:
+          type: string
+          description: Forwarded by services/api for audit/context; plant lookup remains the source of truth in the current AI handler.
         filters:
           type: object
           additionalProperties: true
           properties:
             assetTag:
               type: string
+            documentTypes:
+              type: array
+              items:
+                type: string
     CopilotQueryResponse:
       type: object
       required: [answer, confidence, citations, relatedAssets, missingInfo]
@@ -226,6 +236,12 @@ components:
           type: string
         failureDescription:
           type: string
+        plantId:
+          type: string
+          description: Forwarded by services/api; the current AI RCA query still looks up matching asset history by tag.
+        userId:
+          type: string
+          description: Forwarded by services/api for future report attribution.
     RcaResponse:
       type: object
       required: [summary, probableCauses, recommendations, confidence, citations]
