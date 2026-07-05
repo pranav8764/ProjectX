@@ -68,6 +68,8 @@ class MockFastAPI:
         def decorator(func):
             return func
         return decorator
+    def include_router(self, *args, **kwargs):
+        pass
 
 class MockHTTPException(Exception):
     def __init__(self, status_code=None, detail=None, *args, **kwargs):
@@ -133,9 +135,49 @@ MISSING_INFO: none
             return MockResponse("Generic LLM mock response")
 
 
+class MockGenAIClient:
+    def __init__(self, api_key=None, *args, **kwargs):
+        self.api_key = api_key
+        self.aio = MockAio()
+        self.models = MockModels()
+
+class MockAio:
+    def __init__(self):
+        self.models = MockModels()
+
+class MockModels:
+    async def embed_content(self, model, contents, config=None):
+        class MockEmbedding:
+            def __init__(self, values):
+                self.values = values
+        class MockEmbeddingsResponse:
+            def __init__(self, embeddings):
+                self.embeddings = embeddings
+        return MockEmbeddingsResponse([MockEmbedding([0.125] * 768)])
+
+    async def generate_content(self, model, contents, config=None):
+        class MockGenerateResponse:
+            def __init__(self, text):
+                self.text = text
+        if "RCA" in contents:
+            return MockGenerateResponse("""
+SUMMARY: Pump P-101 experienced persistent mechanical seal failure due to high fluid temperatures.
+PROBABLE_CAUSES: Seal degradation from dry running, improper cooling, excessive vibration
+RECOMMENDATIONS: Inspect cooling loop flow, verify alignment, install thermal sensors
+CONFIDENCE: 0.95
+""")
+        elif "RAG" in contents or "excerpts" in contents:
+            return MockGenerateResponse("""
+ANSWER: Pump P-101 mechanical seal failed on 12 Jan 2025 [1] due to high pressure (150 psi) as noted in maintenance log [2].
+CONFIDENCE: 0.90
+MISSING_INFO: none
+""")
+        return MockGenerateResponse("Generic LLM mock response")
+
+
 # Inject mock modules if they are not already installed on the system
 needed_mocks = {
-    "fastapi": (MockFastAPI, ["FastAPI", "HTTPException", "BackgroundTasks"]),
+    "fastapi": (MockFastAPI, ["FastAPI", "HTTPException", "BackgroundTasks", "APIRouter"]),
     "pydantic": (MockBaseModel, ["BaseModel"]),
     "asyncpg": (MagicMock(), []),
     "numpy": (MagicMock(), []),
@@ -153,15 +195,45 @@ needed_mocks = {
     "groq": (MagicMock(), ["Groq"])
 }
 
-for module_name, (mock_obj, sub_attribs) in needed_mocks.items():
-    if module_name not in sys.modules:
-        sys.modules[module_name] = mock_obj
-    # Handle specific imports
-    for attr in sub_attribs:
-        setattr(mock_obj, attr, mock_obj if attr != "BaseModel" else MockBaseModel)
+force_mock = {"asyncpg", "spacy", "groq", "google.generativeai"}
 
-sys.modules["google"].generativeai = sys.modules["google.generativeai"]
-            
+for module_name, (mock_obj, sub_attribs) in needed_mocks.items():
+    should_mock = True
+    if module_name not in force_mock:
+        try:
+            __import__(module_name)
+            should_mock = False
+        except ImportError:
+            pass
+
+    if should_mock:
+        if module_name not in sys.modules:
+            sys.modules[module_name] = mock_obj
+        # Handle specific imports
+        for attr in sub_attribs:
+            setattr(mock_obj, attr, mock_obj if attr != "BaseModel" else MockBaseModel)
+
+# Mock google.genai module
+try:
+    import google.genai as real_genai
+    real_genai.Client = MockGenAIClient
+except ImportError:
+    class MockGenAIModule:
+        Client = MockGenAIClient
+        types = MagicMock()
+    sys.modules["google.genai"] = MockGenAIModule
+    sys.modules["google.genai.types"] = MockGenAIModule.types
+
+# Ensure real or mock "google" module has the genai & generativeai attributes
+try:
+    import google
+except ImportError:
+    google = MagicMock()
+    sys.modules["google"] = google
+
+google.genai = sys.modules["google.genai"]
+google.generativeai = sys.modules["google.generativeai"]
+
 # Override HTTPException explicitly to behave like a standard exception for testing
 import fastapi
 fastapi.HTTPException = MockHTTPException
@@ -284,9 +356,8 @@ class TestMockIntegration(unittest.TestCase):
             "SELECT organization_id, plant_id": {"organization_id": uuid.uuid4(), "plant_id": uuid.uuid4()}
         }
         
-        # Patches for files OCR and conversion to bypass filesystem interactions
-        with patch('services.ai.app.main.extract_pdf_pages', return_value=[(1, "Pump P-101 has a mechanical seal leakage on 12 Jan 2025. Pressure: 150 psi. Factory Act governed.")]), \
-             patch('services.ai.app.main.extract_tables', return_value=[]):
+        with patch('app.routes.ingestion.extract_pdf_pages', return_value=[(1, "Pump P-101 has a mechanical seal leakage on 12 Jan 2025. Pressure: 150 psi. Factory Act governed.")]), \
+             patch('app.routes.ingestion.extract_tables', return_value=[]):
              
             # Run ingestion
             asyncio.run(self.main.run_ingestion_pipeline(
@@ -336,8 +407,8 @@ class TestMockIntegration(unittest.TestCase):
             "SELECT organization_id, plant_id": {"organization_id": uuid.uuid4(), "plant_id": uuid.uuid4()}
         }
 
-        with patch('services.ai.app.main.extract_generic_text', return_value=""), \
-             patch('services.ai.app.main.extract_tables', return_value=[]):
+        with patch('app.routes.ingestion.extract_generic_text', return_value=""), \
+             patch('app.routes.ingestion.extract_tables', return_value=[]):
             asyncio.run(self.main.run_ingestion_pipeline(
                 document_id=doc_id,
                 file_path="empty.txt",
@@ -473,7 +544,7 @@ MISSING_INFO: none
             organizationId=str(org_id),
         )
 
-        with patch("services.ai.app.main.generate_text_llm", side_effect=fake_generate):
+        with patch("app.utils.ai_clients.generate_text_llm", side_effect=fake_generate):
             response = asyncio.run(self.main.rag_query(req))
 
         self.assertEqual(len(response["citations"]), 1)
@@ -569,6 +640,27 @@ MISSING_INFO: none
         v_gaps = [g for g in gaps if g["assetTag"] == "V-202"]
         self.assertEqual(v_gaps[0]["gapType"], "EXPIRED_CERTIFICATE")
         self.assertEqual(v_gaps[0]["severity"], "CRITICAL")
+
+    def test_rate_limiting(self):
+        """Test TokenBucketLimiter allows burst requests but rate limits when exceeded"""
+        from services.ai.app.main import TokenBucketLimiter
+        
+        limiter = TokenBucketLimiter(rate=1.0, capacity=2.0)
+        
+        allowed1, retry_after1 = limiter.allow("client-1")
+        allowed2, retry_after2 = limiter.allow("client-1")
+        
+        self.assertTrue(allowed1)
+        self.assertTrue(allowed2)
+        self.assertEqual(retry_after1, 0.0)
+        self.assertEqual(retry_after2, 0.0)
+        
+        allowed3, retry_after3 = limiter.allow("client-1")
+        self.assertFalse(allowed3)
+        self.assertTrue(retry_after3 > 0.0)
+        
+        allowed_other, _ = limiter.allow("client-2")
+        self.assertTrue(allowed_other)
 
     async def get_dummy_datetime(self):
         from datetime import datetime

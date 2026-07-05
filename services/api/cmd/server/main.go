@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -270,12 +271,32 @@ func main() {
 		}
 		c.Next()
 	})
-	r.Use(RateLimitMiddleware(300, time.Minute))
+
+	// Parse rate-limiting configurations
+	globalRateLimit := 300
+	if val, err := strconv.Atoi(os.Getenv("API_RATE_LIMIT")); err == nil {
+		globalRateLimit = val
+	}
+	globalRateLimitWindow := time.Minute
+	if val, err := time.ParseDuration(os.Getenv("API_RATE_LIMIT_WINDOW")); err == nil {
+		globalRateLimitWindow = val
+	}
+
+	authRateLimit := 120
+	if val, err := strconv.Atoi(os.Getenv("API_AUTH_RATE_LIMIT")); err == nil {
+		authRateLimit = val
+	}
+	authRateLimitWindow := time.Minute
+	if val, err := time.ParseDuration(os.Getenv("API_AUTH_RATE_LIMIT_WINDOW")); err == nil {
+		authRateLimitWindow = val
+	}
+
+	r.Use(RateLimitMiddleware(globalRateLimit, globalRateLimitWindow))
 
 	// Auth Middleware
 	authGroup := r.Group("/api")
 	authGroup.Use(AuthMiddleware(dbPool))
-	authGroup.Use(RateLimitMiddleware(120, time.Minute))
+	authGroup.Use(RateLimitMiddleware(authRateLimit, authRateLimitWindow))
 
 	// Endpoints
 	authGroup.GET("/me", handleGetMe())

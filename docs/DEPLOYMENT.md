@@ -24,26 +24,41 @@ Seed demo data after PostgreSQL is running:
 make db-seed
 ```
 
-Run the web app from the host:
-
-```bash
-npm --prefix apps/web ci
-npm --prefix apps/web run dev
-```
+Run the web app:
+- **Inside Docker Compose (Recommended)**: The Next.js frontend has been containerized and is automatically built and launched on port `3000` when running:
+  ```bash
+  docker compose up --build
+  ```
+- **From Host (Development)**: You can also run it locally on your host machine:
+  ```bash
+  npm --prefix apps/web ci
+  npm --prefix apps/web run dev
+  ```
 
 Useful local URLs:
-
 - API health: `http://localhost:8080/health`
 - AI health: `http://localhost:8000/health`
 - MinIO console: `http://localhost:9001`
 - Web app: `http://localhost:3000`
 
-After the stack is up, run a live smoke check:
+### Security Configuration
 
+CORS policies and rate limits are fully tunable via environment variables in `docker-compose.yml` or your local `.env` file:
+- **CORS Allowed Origins**:
+  * `CORS_ALLOWED_ORIGINS`: Comma-separated list of allowed origins (default: `http://localhost:3000`).
+- **Go API Rate-Limiting**:
+  * `API_RATE_LIMIT`: Router level limit window count (default: `300`).
+  * `API_RATE_LIMIT_WINDOW`: Router limit time frame (default: `1m`).
+  * `API_AUTH_RATE_LIMIT`: `/api` route limit window count (default: `120`).
+  * `API_AUTH_RATE_LIMIT_WINDOW`: `/api` limit time frame (default: `1m`).
+- **Python AI Rate-Limiting**:
+  * `AI_RATE_LIMIT_RPS`: Requests per second rate per client (default: `5.0`).
+  * `AI_RATE_LIMIT_BURST`: Token bucket capacity burst (default: `20.0`).
+
+After the stack is up, run a live smoke check:
 ```bash
 make smoke
 ```
-
 The smoke check calls API and AI `/health`, then verifies `/api/me` with `PLANTBRAIN_API_TOKEN` or the local `dev-token`. Set `PLANTBRAIN_SKIP_AUTH_SMOKE=1` to skip the auth probe for non-dev environments, or `PLANTBRAIN_SMOKE_LIVE_AI=1` to run the live AI endpoint checks from `tests/integration_test.py`.
 
 ## Runtime Strategy

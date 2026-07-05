@@ -21,7 +21,7 @@
 - Owns: OCR/text extraction, table extraction, markdown normalization, chunking, entity extraction, embedding generation, vector search, cited RAG answers, RCA generation, compliance scans
 - Uses schemas: `ingestion`, `graph`, `rag`, `rca`, `compliance`, `ai`
 - Contract: `contracts/openapi/ai.yaml`
-- Implementation reference: implemented FastAPI routes live in `services/ai/app/main.py`.
+- Implementation reference: implemented FastAPI routers live under `services/ai/app/routes/` and are registered in `services/ai/app/main.py`.
 
 ## Supporting Runtime
 

@@ -10,6 +10,7 @@ x-service-env: &service-env
   LOG_LEVEL: info
   APP_ENV: development
   UPLOADS_DIR: /app/uploads
+  CORS_ALLOWED_ORIGINS: http://localhost:3000
 
 services:
   postgres:
@@ -52,6 +53,10 @@ services:
       <<: *service-env
       PORT: 8080
       S3_ENDPOINT: minio:9000 # inside docker network
+      API_RATE_LIMIT: 300
+      API_RATE_LIMIT_WINDOW: 1m
+      API_AUTH_RATE_LIMIT: 120
+      API_AUTH_RATE_LIMIT_WINDOW: 1m
     ports:
       - "8080:8080"
     volumes:
@@ -70,6 +75,8 @@ services:
       PORT: 8000
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
+      AI_RATE_LIMIT_RPS: 5.0
+      AI_RATE_LIMIT_BURST: 20.0
     expose:
       - "8000"
     volumes:
@@ -78,6 +85,25 @@ services:
       - postgres
       - redis
       - minio
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        - NEXT_API_URL=http://api:8080
+        - NEXT_AI_URL=http://ai:8000
+    container_name: plantbrain-web
+    environment:
+      NEXT_API_URL: http://api:8080
+      NEXT_AI_URL: http://ai:8000
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+      - ai
 
 volumes:
   postgres-data:

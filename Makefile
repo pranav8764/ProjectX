@@ -49,7 +49,7 @@ test-api:
 	go -C services/api test ./...
 
 test-ai:
-	python3 tests/integration_test.py
+	@if [ -f .venv/bin/python3 ]; then .venv/bin/python3 tests/integration_test.py; else python3 tests/integration_test.py; fi
 
 test-web:
 	npm --prefix apps/web ci

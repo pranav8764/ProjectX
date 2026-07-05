@@ -1,11 +1,11 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     tesseract-ocr \
     poppler-utils \
-    libgl1-mesa-glx \
+    libgl1 \
     default-jdk \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,4 +24,4 @@ COPY . .
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["python", "app/main.py"]
+CMD ["python", "-m", "app.main"]
