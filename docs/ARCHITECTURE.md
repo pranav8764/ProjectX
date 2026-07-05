@@ -94,6 +94,26 @@ Upload request
   -> services/ai marks document status COMPLETED or FAILED
 ```
 
+## Stateful Copilot & Memory Graph
+
+The RAG query workflow utilizes a compiled **LangGraph** state machine. This replaces simple procedural lookups with stateful reasoning, intent classification, memory persistence, and citation validation:
+
+```text
+User Question
+  -> [guardrail_node] (Input validation & PII check)
+  -> [intent_router_node] (LLM classifies query as RAG_QUERY or GENERAL)
+  -> [retrieval_node] (Optimized pgvector & text keyword fallback search)
+  -> [rbac_node] (Enforces document-level roles access filtering)
+  -> [generation_node] (LLM synthesizes cited response using context)
+  -> [validation_node] (Self-correcting verification of citations; loops to rewrite up to 3 times)
+  -> [END]
+```
+
+### Memory Checkpointing
+- **Short-Term Memory**: Conversation histories are stored automatically using LangGraph checkpointers. In production runs, the graph uses `AsyncPostgresSaver` backed by a PostgreSQL connection pool (`psycopg_pool`), saving session states under unique thread IDs. For testing and offline runs, the saver falls back to in-memory `MemorySaver`.
+- **Model Auditing**: Latency, token usage (prompt and completion), and caller metadata are audited asynchronously into the `ai.model_calls` table.
+
 ## Split Criteria
 
 Create a new runtime service only when the MVP has a concrete need such as independent scaling, separate ownership with active code, distinct deployment lifecycle, or stronger isolation. Until then, keep domain code inside `services/api` or `services/ai` and update contracts first when request, response, or event shapes change.
+

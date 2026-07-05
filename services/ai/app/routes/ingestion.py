@@ -125,12 +125,11 @@ async def run_ingestion_pipeline(document_id: str, file_path: str, file_type: st
         await update_status(document_id, "EXTRACTING_ENTITIES", 0.8, document_version_id=document_version_id)
         entities = extract_entities(chunks)
 
-        # 7. Generate 1536-dimensional Gemini Embeddings
         await update_status(document_id, "GENERATING_EMBEDDINGS", 0.9, document_version_id=document_version_id)
-        embeddings = []
-        for chunk in chunks:
-            emb = await get_gemini_embedding_1536(chunk["text"])
-            embeddings.append(emb)
+        from app.utils.ai_clients import get_gemini_embeddings_1536_batch
+        chunk_texts = [chunk["text"] for chunk in chunks]
+        org_id = metadata.get("organization_id") or metadata.get("organizationId") if isinstance(metadata, dict) else None
+        embeddings = await get_gemini_embeddings_1536_batch(chunk_texts, org_id=org_id)
 
         # 8. Store Results in Database
         await update_status(document_id, "STORING_RESULTS", 0.95, document_version_id=document_version_id)

@@ -1,5 +1,6 @@
 import re
 import uuid
+import logging
 from typing import Any, Dict
 
 import app.database as database
@@ -18,267 +19,112 @@ from app.utils.helpers import (
 )
 from fastapi import APIRouter
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 
 @router.post("/query")
 async def rag_query(request: CopilotQueryRequest):
-    """Executes hybrid pgvector search and synthesizes answers with citations"""
+    """Executes stateful LangGraph Copilot workflow incorporating memory, routing, and guardrails"""
     if not database.db_pool:
-        return graceful_query_response(
-            request.question, "Database connection unavailable"
-        )
-
-    if query_looks_unsafe(request.question):
-        return {
-            "answer": "I cannot provide unsafe operational bypasses or legal/compliance certification. Review the authorized SOP and have a qualified supervisor approve any critical action.",
-            "confidence": 0.0,
-            "citations": [],
-            "relatedAssets": extract_asset_tags(request.question),
-            "missingInfo": [
-                "Query requested unsafe, unsupported, or certification-like guidance."
-            ],
-            "fallback": True,
-        }
+        return graceful_query_response(request.question, "Database connection unavailable")
 
     try:
         plant_uuid = optional_uuid(request.plantId)
         if not plant_uuid:
-            return graceful_query_response(
-                request.question, "Invalid or missing plantId"
-            )
+            return graceful_query_response(request.question, "Invalid or missing plantId")
 
-        # Generate 1536-dimensional query embedding
-        query_embedding = await ai_clients.get_gemini_embedding_1536(request.question)
-
-        # Parse filters
-        filters = request.filters or {}
-        asset_filter = filters.get("assetTag") if isinstance(filters, dict) else None
-        document_type_filters = (
-            normalize_filter_values(
-                filters.get("documentTypes") or filters.get("documentType")
-            )
-            if isinstance(filters, dict)
-            else []
-        )
-        date_from = filters.get("dateFrom") if isinstance(filters, dict) else None
-        date_to = filters.get("dateTo") if isinstance(filters, dict) else None
-
-        # 1. Retrieve Candidate Chunks (pgvector Cosine Distance <->)
+        # Resolve org_id
         async with database.db_pool.acquire() as conn:
             org_row = await conn.fetchrow(
-                "SELECT organization_id FROM identity.plants WHERE id = $1", plant_uuid
+                "SELECT organization_id FROM identity.plants WHERE id = $1",
+                plant_uuid
             )
             if not org_row:
                 return graceful_query_response(request.question, "Plant not found")
-
             org_id = optional_uuid(request.organizationId) or org_row["organization_id"]
-            if (
-                optional_uuid(request.organizationId)
-                and org_row["organization_id"] != org_id
-            ):
-                return graceful_query_response(
-                    request.question, "Plant is outside the requested organization"
-                )
 
-            current_user_role = await resolve_request_role(
-                conn, request, plant_uuid, org_id
-            )
-            access_columns = await get_document_access_columns(conn)
-            access_select = document_access_select(access_columns)
+        # LangGraph Threading (Short-Term Memory Session Key)
+        # Use userId, filters thread ID hint, or dynamic fallback
+        thread_id = str(request.userId or uuid.uuid4())
+        filters = request.filters or {}
+        if isinstance(filters, dict) and filters.get("threadId"):
+            thread_id = str(filters["threadId"])
+            
+        config = {"configurable": {"thread_id": thread_id}}
 
-            chunks_rows = await conn.fetch(
-                f"""
-                SELECT c.id, c.document_id, c.page_no, c.chunk_text, d.title,
-                       {access_select},
-                       (c.embedding <=> $1) as distance
-                FROM ingestion.document_chunks c
-                JOIN document.documents d ON c.document_id = d.id
-                WHERE d.plant_id = $2
-                  AND d.organization_id = $3
-                  AND d.status <> 'ARCHIVED'
-                  AND c.document_version_id = d.current_version_id
-                  AND (cardinality($4::text[]) = 0 OR d.document_type = ANY($4::text[]))
-                  AND ($5::timestamptz IS NULL OR d.created_at >= $5::timestamptz)
-                  AND ($6::timestamptz IS NULL OR d.created_at <= $6::timestamptz)
-                ORDER BY distance ASC
-                LIMIT 6
-            """,
-                query_embedding,
-                plant_uuid,
-                org_id,
-                document_type_filters,
-                date_from,
-                date_to,
-            )
+        # Initialize input state
+        from langchain_core.messages import HumanMessage
+        inputs = {
+            "messages": [HumanMessage(content=request.question)],
+            "plant_id": str(plant_uuid),
+            "organization_id": str(org_id),
+            "user_id": request.userId,
+            "user_role": request.userRole or "viewer",
+            "filters": filters,
+            "retrieved_chunks": [],
+            "rbac_allowed_chunks": [],
+            "missing_info": [],
+            "validation_attempts": 0,
+            "validation_errors": []
+        }
 
-            # 2. Keyword/Exact Tag search fallback (if tag is queried or contained)
-            keyword_chunks = []
-            extracted_tags = re.findall(
-                r"\b[A-Z]+[-\s]*\d+[A-Z]*\b", request.question.upper()
-            )
-            if asset_filter:
-                extracted_tags.append(asset_filter.upper())
-
-            if extracted_tags:
-                tag_queries = [f"%{tag}%" for tag in extracted_tags]
-                for t_q in tag_queries:
-                    k_rows = await conn.fetch(
-                        f"""
-                        SELECT c.id, c.document_id, c.page_no, c.chunk_text, d.title,
-                               {access_select},
-                               0.0 as distance
-                        FROM ingestion.document_chunks c
-                        JOIN document.documents d ON c.document_id = d.id
-                        WHERE d.plant_id = $1
-                          AND d.organization_id = $3
-                          AND d.status <> 'ARCHIVED'
-                          AND c.document_version_id = d.current_version_id
-                          AND (cardinality($4::text[]) = 0 OR d.document_type = ANY($4::text[]))
-                          AND ($5::timestamptz IS NULL OR d.created_at >= $5::timestamptz)
-                          AND ($6::timestamptz IS NULL OR d.created_at <= $6::timestamptz)
-                          AND (c.chunk_text ILIKE $2 OR d.title ILIKE $2)
-                        LIMIT 3
-                    """,
-                        plant_uuid,
-                        t_q,
-                        org_id,
-                        document_type_filters,
-                        date_from,
-                        date_to,
-                    )
-                    keyword_chunks.extend(k_rows)
-
-            # Combine searches
-            seen = set()
-            combined_results = []
-            restricted_matches = 0
-            for r in keyword_chunks + list(chunks_rows):
-                if r["id"] not in seen:
-                    seen.add(r["id"])
-                    if not document_row_access_allowed(r, current_user_role):
-                        restricted_matches += 1
-                        continue
-                    combined_results.append(r)
-
-            # Sort combined results
-            combined_results = combined_results[:6]
-
-            if not combined_results:
-                missing_info = []
-                if restricted_matches:
-                    missing_info.append(
-                        "Some matching sources are restricted for the current user role."
-                    )
-                return {
-                    "answer": "No accessible documentation or evidence was found for the query in this plant's database.",
-                    "confidence": 0.0,
-                    "citations": [],
-                    "relatedAssets": [],
-                    "missingInfo": missing_info,
-                }
-
-            # 3. Construct prompt
-            context_blocks = []
-            citations = []
-            for idx, r in enumerate(combined_results):
-                context_blocks.append(
-                    f"[{idx + 1}] Doc: {r['title']} (Page {r['page_no']})\n{r['chunk_text']}"
-                )
-                citations.append(
-                    {
-                        "documentId": str(r["document_id"]),
-                        "documentTitle": r["title"],
-                        "page": r["page_no"],
-                        "snippet": r["chunk_text"][:200] + "...",
-                    }
-                )
-
-            context_str = "\n\n".join(context_blocks)
-            prompt = f"""
-You are an expert industrial engineering AI. Answer the following technical question based ONLY on the provided document excerpts.
-Every fact in your answer must cite the source excerpt index like [1] or [2] matching the provided texts.
-If the information is not present, clearly state what information is missing.
-
-Question: {request.question}
-
-Excerpts:
-{context_str}
-
-Format your output exactly as:
-ANSWER: <detailed answer citing [1], [2] etc>
-CONFIDENCE: <estimated floating point score between 0.0 and 1.0>
-MISSING_INFO: <comma separated details of any missing info or data gaps, or None>
-"""
-            llm_output = await ai_clients.generate_text_llm(prompt)
-
-            # Parse output
-            answer = "Unable to process query."
-            confidence = 0.5
-            missing_info = []
-
+        # Resolve LangGraph Checkpointer
+        from langgraph.checkpoint.memory import MemorySaver
+        from app.graph import compile_copilot_graph
+        
+        checkpointer = None
+        if database.psycopg_pool:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
             try:
-                ans_match = re.search(
-                    r"ANSWER:\s*(.*?)(?=CONFIDENCE:|$)", llm_output, re.DOTALL
-                )
-                conf_match = re.search(r"CONFIDENCE:\s*([\d\.]+)", llm_output)
-                miss_match = re.search(r"MISSING_INFO:\s*(.*)", llm_output)
+                saver = AsyncPostgresSaver(database.psycopg_pool)
+                # Call setup once to prepare checkpoints schema tables
+                await saver.setup()
+                checkpointer = saver
+                logger.info("Using stateful PostgreSQL checkpointer for thread session")
+            except Exception as pg_err:
+                logger.warning(f"Failed to initialize PostgreSQL checkpointer: {pg_err}. Falling back to MemorySaver.")
+                checkpointer = MemorySaver()
+        else:
+            checkpointer = MemorySaver()
 
-                if ans_match:
-                    answer = ans_match.group(1).strip()
-                if conf_match:
-                    confidence = float(conf_match.group(1).strip())
-                if miss_match:
-                    info_text = miss_match.group(1).strip()
-                    if info_text.lower() != "none" and info_text:
-                        missing_info = [
-                            x.strip() for x in info_text.split(",") if x.strip()
-                        ]
-            except Exception as parse_e:
-                answer = llm_output
+        # Compile and execute Graph
+        graph = compile_copilot_graph(checkpointer=checkpointer)
+        state_result = await graph.ainvoke(inputs, config=config)
 
-            if not answer_has_citation(answer, len(citations)):
-                missing_info.append(
-                    "The generated answer did not include valid source citations, so it was not returned as a factual answer."
-                )
-                answer = "Not enough cited evidence is available to answer safely. Please review the source documents or refine the question."
-                confidence = min(confidence, 0.2)
+        # Extract final outputs
+        answer = state_result.get("answer") or "Not enough evidence is available to answer safely right now."
+        confidence = state_result.get("confidence") if state_result.get("confidence") is not None else 0.0
+        citations = state_result.get("citations") or []
+        missing_info = state_result.get("missing_info") or []
+        related_assets = extract_asset_tags(request.question)
 
-            # Save query log to DB
-            query_uuid = uuid.uuid4()
-            await conn.execute(
-                """
+        # Log query history and citations to RAG schema tables
+        query_uuid = uuid.uuid4()
+        async with database.db_pool.acquire() as conn:
+            await conn.execute("""
                 INSERT INTO rag.queries (id, organization_id, plant_id, user_id, query_text, answer_text, confidence)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-            """,
-                query_uuid,
-                org_id,
-                plant_uuid,
-                optional_uuid(request.userId),
-                request.question,
-                answer,
-                confidence,
-            )
+            """, query_uuid, org_id, plant_uuid, optional_uuid(request.userId), request.question, answer, confidence)
 
             for citation in citations:
-                await conn.execute(
-                    """
-                    INSERT INTO rag.citations (query_id, document_id, page_no, quoted_text)
-                    VALUES ($1, $2, $3, $4)
-                """,
-                    query_uuid,
-                    uuid.UUID(citation["documentId"]),
-                    citation["page"],
-                    citation["snippet"],
-                )
+                try:
+                    await conn.execute("""
+                        INSERT INTO rag.citations (query_id, document_id, page_no, quoted_text)
+                        VALUES ($1, $2, $3, $4)
+                    """, query_uuid, uuid.UUID(citation["documentId"]), citation["page"], citation["snippet"])
+                except Exception as cit_err:
+                    logger.warning(f"Failed to save query citation to DB: {cit_err}")
 
-            return {
-                "answer": answer,
-                "confidence": confidence,
-                "citations": citations,
-                "relatedAssets": extracted_tags,
-                "missingInfo": missing_info,
-            }
+        return {
+            "answer": answer,
+            "confidence": confidence,
+            "citations": citations,
+            "relatedAssets": related_assets,
+            "missingInfo": missing_info
+        }
 
     except Exception as e:
+        logger.error(f"Error executing LangGraph Copilot workflow: {e}", exc_info=True)
         return graceful_query_response(request.question, str(e))

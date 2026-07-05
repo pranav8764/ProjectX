@@ -1,16 +1,23 @@
 import asyncio
 import asyncpg
 from typing import Optional, Any
+from psycopg_pool import AsyncConnectionPool
 from app.config import DATABASE_URL, logger
 
 db_pool: Optional[asyncpg.Pool] = None
+psycopg_pool: Optional[AsyncConnectionPool] = None
 
 async def init_db_pool():
-    global db_pool
+    global db_pool, psycopg_pool
     for i in range(5):
         try:
             db_pool = await asyncpg.create_pool(DATABASE_URL)
-            logger.info("Successfully connected to PostgreSQL")
+            logger.info("Successfully connected to PostgreSQL via asyncpg")
+            
+            # Also initialize psycopg pool for LangGraph PostgresSaver
+            psycopg_pool = AsyncConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=10)
+            await psycopg_pool.open()
+            logger.info("Successfully connected to PostgreSQL via psycopg AsyncConnectionPool")
             break
         except Exception as e:
             logger.warning(f"Database connection failed, retrying in 2s ({i+1}/5): {e}")
@@ -19,10 +26,13 @@ async def init_db_pool():
         logger.error("Failed to connect to database. Pool is unavailable.")
 
 async def close_db_pool():
-    global db_pool
+    global db_pool, psycopg_pool
     if db_pool:
         await db_pool.close()
-        logger.info("Database connection closed")
+        logger.info("Database connection closed (asyncpg)")
+    if psycopg_pool:
+        await psycopg_pool.close()
+        logger.info("Database connection closed (psycopg)")
 
 async def get_document_access_columns(conn: Any) -> set:
     try:
