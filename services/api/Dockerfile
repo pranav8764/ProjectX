@@ -12,7 +12,7 @@ RUN go mod download
 COPY . .
 
 # Build the server binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server cmd/server/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server ./cmd/server
 
 # Production stage
 FROM alpine:latest

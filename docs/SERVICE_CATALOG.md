@@ -10,7 +10,7 @@
 - Uses schemas: `identity`, `document`, `asset`, `compliance`, `report`, `rag`, `rca`
 - Calls: `services/ai`
 - Contract: `contracts/openapi/api.yaml`
-- Implementation reference: consolidated API routes are implemented in `services/api/cmd/server/main.go`.
+- Implementation reference: API routes are defined in `services/api/cmd/server/main.go`, with handlers and middleware modularized under `services/api/internal/`.
 
 ## AI
 
