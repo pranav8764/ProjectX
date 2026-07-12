@@ -71,8 +71,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Initialize the database pool
+    # Startup: Initialize the database pool, then compile the copilot graph once
+    # (checkpointer setup is a DDL round-trip we do not want on every request).
     await init_db_pool()
+    try:
+        from app.graph import init_copilot_graph
+        await init_copilot_graph()
+    except Exception as e:
+        import logging
+        logging.getLogger("plantbrain-ai").warning(f"Deferred copilot graph init to first request: {e}")
     yield
     # Shutdown: Close the database pool
     await close_db_pool()

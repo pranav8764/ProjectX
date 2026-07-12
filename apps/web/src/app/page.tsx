@@ -3,20 +3,20 @@
 import React, { useState, useEffect } from 'react';
 import NavigationShell from '../components/NavigationShell';
 import { useData } from '../context/DataContext';
-import { getStoredSession, PlantBrainSession } from '../lib/api';
+import { apiFetch, appendPlantQuery, getStoredSession, PlantBrainSession } from '../lib/api';
 import { canRunAction, getRoleLabel } from '../lib/permissions';
 import {
   FileText,
   Layers,
   ShieldAlert,
-  Award,
   TrendingUp,
   Activity,
   ArrowUpRight,
   Clock,
   CheckCircle2,
   AlertTriangle,
-  ChevronRight
+  ChevronRight,
+  Network
 } from 'lucide-react';
 import Link from 'next/link';
 import {
@@ -33,14 +33,50 @@ import {
   Cell
 } from 'recharts';
 
+interface DashboardMetrics {
+  querySuccessRate: number;
+  averageQueryConfidence: number;
+  knowledgeGraphEntities: number;
+  knowledgeGraphRelationships: number;
+  knowledgeGraphCompleteness: number;
+  timeSavedEstimateMinutes: number;
+}
+
 export default function DashboardPage() {
-  const { documents, assets, complianceGaps, certificates } = useData();
+  const { documents, assets, complianceGaps } = useData();
   const [mounted, setMounted] = useState(false);
   const [session, setSession] = useState<PlantBrainSession | null>(null);
+  const [metrics, setMetrics] = useState<DashboardMetrics | null>(null);
 
   useEffect(() => {
     setMounted(true);
     setSession(getStoredSession());
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadMetrics = async () => {
+      const res = await apiFetch(appendPlantQuery('/api/dashboard/metrics'));
+      if (!res.ok) return;
+      const data = await res.json();
+      if (cancelled) return;
+      setMetrics({
+        querySuccessRate: Number(data.querySuccessRate || 0),
+        averageQueryConfidence: Number(data.averageQueryConfidence || 0),
+        knowledgeGraphEntities: Number(data.knowledgeGraphEntities || 0),
+        knowledgeGraphRelationships: Number(data.knowledgeGraphRelationships || 0),
+        knowledgeGraphCompleteness: Number(data.knowledgeGraphCompleteness || 0),
+        timeSavedEstimateMinutes: Number(data.timeSavedEstimateMinutes || 0),
+      });
+    };
+
+    // Gracefully ignore fetch/parse failures: fall back to computed values / dashes.
+    loadMetrics().catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const canViewCompliance = canRunAction(session?.role, 'view_compliance');
@@ -48,8 +84,17 @@ export default function DashboardPage() {
   // Compute stats
   const totalDocs = documents.filter(d => ['COMPLETED', 'PARTIAL_SUCCESS'].includes(d.status)).length;
   const totalAssets = assets.length;
-  const expiredCerts = certificates.filter(c => c.status === 'Expired' || c.status === 'Overdue').length;
-  const openGaps = complianceGaps.filter(g => g.status === 'Open').length + expiredCerts;
+  const linkedAssets = assets.filter(a => (a.documents || []).length > 0).length;
+  const openGaps = complianceGaps.filter(g => g.status === 'Open').length;
+
+  // API-derived spec metrics (dash-fallback when the endpoint is unreachable)
+  const querySuccessRateLabel = metrics ? `${Math.round(metrics.querySuccessRate * 100)}%` : '—';
+  const graphCompletenessLabel = metrics ? `${Math.round(metrics.knowledgeGraphCompleteness * 100)}%` : '—';
+  const timeSavedLabel = metrics
+    ? metrics.timeSavedEstimateMinutes >= 60
+      ? `${(metrics.timeSavedEstimateMinutes / 60).toFixed(1)} hrs`
+      : `${metrics.timeSavedEstimateMinutes} min`
+    : '—';
 
   // Calculate average risk score
   const avgRisk = Math.round(assets.reduce((acc, curr) => acc + curr.riskScore, 0) / (totalAssets || 1));
@@ -105,7 +150,7 @@ export default function DashboardPage() {
       <div className="space-y-8">
 
         {/* Metric Cards Row */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
 
           {/* Total Documents */}
           <div className="glass-panel hover:border-emerald-500/20 transition-all duration-300 p-6 rounded-2xl group relative overflow-hidden">
@@ -145,10 +190,10 @@ export default function DashboardPage() {
             <div className="flex items-baseline gap-2 mt-1">
               <span className="text-3xl font-extrabold text-white">{totalAssets}</span>
               <span className="text-[10px] bg-cyber-emerald/10 text-cyber-emerald border border-cyber-emerald/20 px-2 py-0.5 rounded-full font-mono">
-                100% linked
+                {linkedAssets}/{totalAssets} linked
               </span>
             </div>
-            <p className="text-[10px] text-slate-500 font-mono mt-3">Mapped via Knowledge Graph relationships</p>
+            <p className="text-[10px] text-slate-500 font-mono mt-3">Assets with at least one linked document</p>
           </div>
 
           {/* Open Compliance Gaps */}
@@ -182,35 +227,71 @@ export default function DashboardPage() {
             </p>
           </div>
 
-          {/* Expired Certificates */}
+        </div>
+
+        {/* Copilot & Knowledge Performance (live API metrics) */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+
+          {/* Query Success Rate */}
+          <div className="glass-panel hover:border-emerald-500/20 transition-all duration-300 p-6 rounded-2xl group relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-24 h-24 bg-cyber-emerald/5 rounded-full blur-2xl pointer-events-none" />
+            <div className="flex items-center justify-between mb-4">
+              <div className="p-3 bg-emerald-500/10 text-cyber-emerald rounded-xl border border-emerald-500/20">
+                <TrendingUp className="w-6 h-6" />
+              </div>
+              <Link href="/copilot" className="text-slate-500 hover:text-cyber-emerald transition-colors">
+                <ArrowUpRight className="w-4 h-4" />
+              </Link>
+            </div>
+            <span className="text-slate-400 font-mono text-xs uppercase tracking-wider block">Query Success Rate</span>
+            <div className="flex items-baseline gap-2 mt-1">
+              <span className="text-3xl font-extrabold text-white">{querySuccessRateLabel}</span>
+              {metrics && (
+                <span className="text-[10px] bg-cyber-emerald/10 text-cyber-emerald border border-cyber-emerald/20 px-2 py-0.5 rounded-full font-mono">
+                  {Math.round(metrics.averageQueryConfidence * 100)}% avg conf
+                </span>
+              )}
+            </div>
+            <p className="text-[10px] text-slate-500 font-mono mt-3">Share of Copilot answers backed by citations</p>
+          </div>
+
+          {/* Knowledge Graph Completeness */}
+          <div className="glass-panel hover:border-indigo-500/20 transition-all duration-300 p-6 rounded-2xl group relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-24 h-24 bg-cyber-indigo/5 rounded-full blur-2xl pointer-events-none" />
+            <div className="flex items-center justify-between mb-4">
+              <div className="p-3 bg-indigo-500/10 text-cyber-indigo rounded-xl border border-indigo-500/20">
+                <Network className="w-6 h-6" />
+              </div>
+              <Link href="/graph" className="text-slate-500 hover:text-cyber-indigo transition-colors">
+                <ArrowUpRight className="w-4 h-4" />
+              </Link>
+            </div>
+            <span className="text-slate-400 font-mono text-xs uppercase tracking-wider block">Knowledge Graph Completeness</span>
+            <div className="flex items-baseline gap-2 mt-1">
+              <span className="text-3xl font-extrabold text-white">{graphCompletenessLabel}</span>
+              {metrics && (
+                <span className="text-[10px] bg-cyber-indigo/10 text-cyber-indigo border border-indigo-500/20 px-2 py-0.5 rounded-full font-mono">
+                  {metrics.knowledgeGraphRelationships}/{metrics.knowledgeGraphEntities} linked
+                </span>
+              )}
+            </div>
+            <p className="text-[10px] text-slate-500 font-mono mt-3">Relationships resolved across extracted entities</p>
+          </div>
+
+          {/* Estimated Time Saved */}
           <div className="glass-panel hover:border-amber-500/20 transition-all duration-300 p-6 rounded-2xl group relative overflow-hidden">
             <div className="absolute top-0 right-0 w-24 h-24 bg-cyber-amber/5 rounded-full blur-2xl pointer-events-none" />
             <div className="flex items-center justify-between mb-4">
               <div className="p-3 bg-amber-500/10 text-cyber-amber rounded-xl border border-cyber-amber/20">
-                <Award className="w-6 h-6" />
+                <Clock className="w-6 h-6" />
               </div>
-              {canViewCompliance ? (
-                <Link href="/compliance" className="text-slate-500 hover:text-cyber-amber transition-colors">
-                  <ArrowUpRight className="w-4 h-4" />
-                </Link>
-              ) : (
-                <span className="text-slate-700" title={`${getRoleLabel(session?.role)} cannot view certificate compliance`}>
-                  <Award className="w-4 h-4" />
-                </span>
-              )}
+              <Activity className="w-4 h-4 text-slate-600" />
             </div>
-            <span className="text-slate-400 font-mono text-xs uppercase tracking-wider block">Expired Certificates</span>
+            <span className="text-slate-400 font-mono text-xs uppercase tracking-wider block">Estimated Time Saved</span>
             <div className="flex items-baseline gap-2 mt-1">
-              <span className="text-3xl font-extrabold text-white">{canViewCompliance ? expiredCerts : '-'}</span>
-              {canViewCompliance && (
-                <span className="text-[10px] bg-amber-500/10 text-cyber-amber border border-cyber-amber/20 px-2 py-0.5 rounded-full font-mono">
-                  {certificates.filter(c => c.status === 'Active').length} active
-                </span>
-              )}
+              <span className="text-3xl font-extrabold text-white">{timeSavedLabel}</span>
             </div>
-            <p className="text-[10px] text-slate-500 font-mono mt-3">
-              {canViewCompliance ? 'Regulatory inspection compliance rate' : 'Hidden for current role'}
-            </p>
+            <p className="text-[10px] text-slate-500 font-mono mt-3">Manual document lookup avoided via cited answers</p>
           </div>
 
         </div>

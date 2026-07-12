@@ -1,17 +1,28 @@
 import asyncio
 import asyncpg
 from typing import Optional, Any
+from pgvector.asyncpg import register_vector
 from psycopg_pool import AsyncConnectionPool
 from app.config import DATABASE_URL, logger
 
 db_pool: Optional[asyncpg.Pool] = None
 psycopg_pool: Optional[AsyncConnectionPool] = None
 
+async def _init_connection(conn: asyncpg.Connection):
+    # Without this codec, binding a Python list to a vector(1536) column raises
+    # DataError and every embedding write / similarity query fails.
+    try:
+        await register_vector(conn)
+    except Exception as e:
+        # Only hit when the vector extension is missing (migrations not applied yet);
+        # keep the pool usable so /health and non-vector queries still work.
+        logger.error(f"pgvector codec registration failed — vector queries will fail: {e}")
+
 async def init_db_pool():
     global db_pool, psycopg_pool
     for i in range(5):
         try:
-            db_pool = await asyncpg.create_pool(DATABASE_URL)
+            db_pool = await asyncpg.create_pool(DATABASE_URL, init=_init_connection)
             logger.info("Successfully connected to PostgreSQL via asyncpg")
             
             # Also initialize psycopg pool for LangGraph PostgresSaver

@@ -6,8 +6,11 @@ const nextConfig = {
     const aiURL = process.env.NEXT_AI_URL || 'http://localhost:8000';
     return [
       {
-        source: '/api/:path*',
-        destination: `${apiURL}/api/:path*`,
+        // Proxy everything under /api EXCEPT /api/auth/* — those are handled locally
+        // by the BetterAuth route handler (app/api/auth/[...all]). The negative
+        // lookahead keeps auth requests from being forwarded to the Go gateway.
+        source: '/api/:path((?!auth/).*)',
+        destination: `${apiURL}/api/:path`,
       },
       {
         source: '/api-health',

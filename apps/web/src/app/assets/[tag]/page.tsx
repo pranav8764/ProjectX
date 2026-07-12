@@ -51,9 +51,9 @@ export default function AssetProfilePage({ params }: { params: { tag: string } }
           id: failure.id,
           date: failure.createdAt?.split('T')[0] || new Date().toISOString().split('T')[0],
           description: failure.failureSummary,
-          severity: 'High',
-          status: 'Open',
-          workOrder: 'RCA',
+          severity: failure.severity ? normalizeSeverityToFailure(failure.severity) : 'High',
+          status: normalizeFailureStatus(failure.status),
+          workOrder: failure.workOrder || 'RCA',
           maintenanceAction: (failure.recommendations || []).join(', ') || 'Review RCA recommendations',
         }));
 
@@ -544,6 +544,22 @@ function normalizeSeverity(value: string | undefined): ComplianceGap['severity']
   if (normalized === 'high') return 'High';
   if (normalized === 'low') return 'Low';
   return 'Medium';
+}
+
+function normalizeSeverityToFailure(value: string | undefined): FailureEvent['severity'] {
+  const normalized = (value || 'High').toLowerCase();
+  if (normalized === 'critical') return 'Critical';
+  if (normalized === 'high') return 'High';
+  if (normalized === 'low') return 'Low';
+  if (normalized === 'medium') return 'Medium';
+  return 'High';
+}
+
+function normalizeFailureStatus(value: string | undefined): FailureEvent['status'] {
+  if (!value) return 'Open';
+  const normalized = value.toLowerCase();
+  if (normalized === 'closed' || normalized === 'resolved' || normalized === 'done') return 'Resolved';
+  return 'Open';
 }
 
 function ProfileMetric({ icon, label, value, detail }: { icon: React.ReactNode; label: string; value: string; detail: string }) {

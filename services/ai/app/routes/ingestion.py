@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List
 
 import asyncpg
-import numpy as np
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
@@ -18,13 +17,11 @@ import pandas as pd
 from PIL import Image
 import pytesseract
 import pdf2image
-import tabula
 
 from app.config import logger, nlp
 from app.schemas import DocumentProcessRequest
 import app.database as database
-from app.utils.ai_clients import get_gemini_embedding_1536
-from app.utils.helpers import optional_uuid
+from app.utils.helpers import normalize_asset_tag
 
 router = APIRouter()
 
@@ -129,7 +126,12 @@ async def run_ingestion_pipeline(document_id: str, file_path: str, file_type: st
         from app.utils.ai_clients import get_gemini_embeddings_1536_batch
         chunk_texts = [chunk["text"] for chunk in chunks]
         org_id = metadata.get("organization_id") or metadata.get("organizationId") if isinstance(metadata, dict) else None
-        embeddings = await get_gemini_embeddings_1536_batch(chunk_texts, org_id=org_id)
+        embeddings, embeddings_are_fallback = await get_gemini_embeddings_1536_batch(chunk_texts, org_id=org_id)
+        if embeddings_are_fallback and chunk_texts:
+            partial_reasons.append(
+                "Real embeddings could not be generated (missing/failing GOOGLE_API_KEY); "
+                "semantic search is disabled for this document until it is reprocessed."
+            )
 
         # 8. Store Results in Database
         await update_status(document_id, "STORING_RESULTS", 0.95, document_version_id=document_version_id)
@@ -322,19 +324,35 @@ def convert_to_markdown(text: str, file_type: str) -> str:
             md_lines.append(stripped)
     return "\n".join(md_lines)
 
+def _rows_to_table(table_id: str, rows: List[List], page_no: int = 1) -> Optional[Dict]:
+    """Normalize a raw table (list of rows, first row = header) into the stored shape."""
+    rows = [r for r in rows if r and any(c is not None and str(c).strip() for c in r)]
+    if not rows:
+        return None
+    header = [str(c).strip() if c is not None else f"col_{i}" for i, c in enumerate(rows[0])]
+    data = []
+    for r in rows[1:]:
+        data.append({header[i] if i < len(header) else f"col_{i}": (str(c).strip() if c is not None else "")
+                     for i, c in enumerate(r)})
+    return {"table_id": table_id, "data": data, "columns": header, "page_no": page_no}
+
 async def extract_tables(file_path: str, file_type: str) -> List[Dict]:
     tables = []
     try:
         if file_type.lower() == "pdf":
+            # pdfplumber (pure Python) — no Java/tabula dependency. Extract per page so
+            # each table keeps its real page number.
+            def _extract_pdf_tables():
+                out = []
+                with pdfplumber.open(file_path) as pdf:
+                    for p_idx, page in enumerate(pdf.pages):
+                        for t_idx, raw in enumerate(page.extract_tables() or []):
+                            normalized = _rows_to_table(f"p{p_idx + 1}_table_{t_idx}", raw, page_no=p_idx + 1)
+                            if normalized and normalized["data"]:
+                                out.append(normalized)
+                return out
             loop = asyncio.get_event_loop()
-            dfs = await loop.run_in_executor(None, lambda: tabula.read_pdf(file_path, pages="all", multiple_tables=True))
-            for i, df in enumerate(dfs):
-                if not df.empty:
-                     tables.append({
-                         "table_id": f"table_{i}",
-                         "data": df.to_dict("records"),
-                         "columns": df.columns.tolist()
-                     })
+            tables.extend(await loop.run_in_executor(None, _extract_pdf_tables))
         elif file_type.lower() in ["xlsx", "xls"]:
             xl = pd.ExcelFile(file_path)
             for name in xl.sheet_names:
@@ -394,12 +412,14 @@ def extract_entities(chunks: List[Dict]) -> List[Dict]:
     entities = []
 
     tag_pattern = re.compile(r"\b(?!(?:VERSION|PAGE|REV|TABLE|FIG|FIGURE)\b)[A-Z]+[-\s]*\d+[A-Z]*\b")
-    date_pattern = re.compile(r"\b\d{1,2}[/\-\]\d{1,2}[/\-\]\d{2,4}\b|\b\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov)[a-z]*\s+\d{2,4}\b", re.IGNORECASE)
+    date_pattern = re.compile(r"\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b|\b\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4}\b", re.IGNORECASE)
     measurement_pattern = re.compile(r"\b\d+\.?\d*\s*(psi|bar|pa|kpa|mpa|°?[cfk]|rpm|hz|khz|mhz|mm|cm|m|km|in|ft)\b", re.IGNORECASE)
     regulation_pattern = re.compile(r"\b(Factory Act|OISD|PESO|ASME|OSHA|API\s*\d+)\b", re.IGNORECASE)
     failure_pattern = re.compile(r"\b(leak(?:age)?|overheat(?:ing)?|vibration|bearing failure|seal failure|cavitation|corrosion|crack|trip|shutdown|fault)\b", re.IGNORECASE)
     action_pattern = re.compile(r"\b(replace(?:d|ment)?|inspect(?:ed|ion)?|repair(?:ed)?|clean(?:ed|ing)?|calibrat(?:ed|ion)|lubricat(?:ed|ion)|tighten(?:ed)?|align(?:ed|ment)?)\b", re.IGNORECASE)
-    severity_pattern = re.compile(r"\b(low|medium|high|critical)\b", re.IGNORECASE)
+    # Bare low/medium/high anywhere in prose floods the graph with noise — only match
+    # labeled contexts ("Severity: High", "high severity/risk/priority", or bare "critical").
+    severity_pattern = re.compile(r"\bseverity\s*[:\-]?\s*(?:low|medium|high|critical)\b|\b(?:low|medium|high|critical)\s+(?:severity|risk|priority)\b|\bcritical\b", re.IGNORECASE)
     location_pattern = re.compile(r"\b(?:Unit|Area|Boiler Area|Pump House|Compressor Bay|Plant|Line)[-\s]?\d*[A-Z]*\b", re.IGNORECASE)
 
     for chunk in chunks:
@@ -549,10 +569,15 @@ async def save_ingestion_results(document_id: str, document_version_id: uuid.UUI
                 mapped_chunk_uuid = chunk_uuids[c_idx] if c_idx < len(chunk_uuids) else None
                 entity_id = uuid.uuid4()
 
+                normalized_value = (
+                    normalize_asset_tag(ent["entity_text"])
+                    if ent["entity_type"] == "EQUIPMENT_TAG"
+                    else ent["entity_text"].upper().strip()
+                )
                 await conn.execute("""
                     INSERT INTO graph.entities (id, organization_id, plant_id, document_id, chunk_id, entity_type, entity_value, normalized_value, confidence, page_no)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                """, entity_id, org_id, plant_id, doc_uuid, mapped_chunk_uuid, ent["entity_type"], ent["entity_text"], ent["entity_text"].upper().strip(), ent["confidence"], ent["page_no"])
+                """, entity_id, org_id, plant_id, doc_uuid, mapped_chunk_uuid, ent["entity_type"], ent["entity_text"], normalized_value, ent["confidence"], ent["page_no"])
 
                 if mapped_chunk_uuid:
                     if mapped_chunk_uuid not in chunk_entities:
@@ -565,44 +590,56 @@ async def save_ingestion_results(document_id: str, document_version_id: uuid.UUI
 
                 # If entity is an asset tag, automatically register/upsert in asset.assets
                 if ent["entity_type"] == "EQUIPMENT_TAG":
-                    asset_tag = ent["entity_text"].upper().strip()
+                    asset_tag = normalize_asset_tag(ent["entity_text"])
                     await conn.execute("""
                         INSERT INTO asset.assets (organization_id, plant_id, asset_tag, asset_name, asset_type)
                         VALUES ($1, $2, $3, $4, $5)
                         ON CONFLICT (plant_id, asset_tag) DO NOTHING
                     """, org_id, plant_id, asset_tag, f"Equipment {asset_tag}", "Asset")
 
-            # 4.1 Store semantic and co-occurrence relationships for entities in the same chunk
+            # 4.1 Store semantic relationships, anchored on asset entities only.
+            # The previous all-pairs CO_OCCURS_WITH was O(n^2) per chunk with one awaited
+            # INSERT per edge and, combined with noisy entity matches, flooded the graph.
             await conn.execute("DELETE FROM graph.relationships WHERE evidence_document_id = $1", doc_uuid)
+            relationship_rows = []
             for chunk_uuid, ents in chunk_entities.items():
                 asset_entities = [ent for ent in ents if ent["type"] == "EQUIPMENT_TAG"]
                 for asset_ent in asset_entities:
-                    await conn.execute("""
-                        INSERT INTO graph.relationships (organization_id, source_entity_id, target_entity_id, relationship_type, confidence, evidence_document_id, evidence_chunk_id)
-                        VALUES ($1, $2, $3, $4, 0.9, $5, $6)
-                    """, org_id, asset_ent["id"], document_entity_id, relationship_for_document_type(document_type), doc_uuid, chunk_uuid)
-
+                    relationship_rows.append((
+                        org_id, asset_ent["id"], document_entity_id,
+                        relationship_for_document_type(document_type), 0.9, doc_uuid, chunk_uuid
+                    ))
                     for target_ent in ents:
-                        if target_ent["id"] == asset_ent["id"]:
+                        if target_ent["id"] == asset_ent["id"] or target_ent["type"] == "EQUIPMENT_TAG":
                             continue
                         relationship_type = relationship_for_entity_type(target_ent["type"])
                         if relationship_type:
-                            await conn.execute("""
-                                INSERT INTO graph.relationships (organization_id, source_entity_id, target_entity_id, relationship_type, confidence, evidence_document_id, evidence_chunk_id)
-                                VALUES ($1, $2, $3, $4, 0.82, $5, $6)
-                            """, org_id, asset_ent["id"], target_ent["id"], relationship_type, doc_uuid, chunk_uuid)
+                            relationship_rows.append((
+                                org_id, asset_ent["id"], target_ent["id"],
+                                relationship_type, 0.82, doc_uuid, chunk_uuid
+                            ))
+                        else:
+                            relationship_rows.append((
+                                org_id, asset_ent["id"], target_ent["id"],
+                                "CO_OCCURS_WITH", 0.8, doc_uuid, chunk_uuid
+                            ))
+                # Asset-to-asset co-occurrence in the same chunk is still meaningful
+                for i in range(len(asset_entities)):
+                    for j in range(i + 1, len(asset_entities)):
+                        relationship_rows.append((
+                            org_id, asset_entities[i]["id"], asset_entities[j]["id"],
+                            "CO_OCCURS_WITH", 0.8, doc_uuid, chunk_uuid
+                        ))
+            if relationship_rows:
+                await conn.executemany("""
+                    INSERT INTO graph.relationships (organization_id, source_entity_id, target_entity_id, relationship_type, confidence, evidence_document_id, evidence_chunk_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """, relationship_rows)
 
-                for i in range(len(ents)):
-                    for j in range(i + 1, len(ents)):
-                        await conn.execute("""
-                            INSERT INTO graph.relationships (organization_id, source_entity_id, target_entity_id, relationship_type, confidence, evidence_document_id, evidence_chunk_id)
-                            VALUES ($1, $2, $3, 'CO_OCCURS_WITH', 0.8, $4, $5)
-                        """, org_id, ents[i]["id"], ents[j]["id"], doc_uuid, chunk_uuid)
-
-            # 5. Store Tables as Entities
+            # 5. Store Tables as Entities (with their real page number)
             for table in tables:
                 table_str = json.dumps(table["data"])
                 await conn.execute("""
                     INSERT INTO graph.entities (organization_id, plant_id, document_id, chunk_id, entity_type, entity_value, normalized_value, confidence, page_no)
-                    VALUES ($1, $2, $3, NULL, 'TABLE', $4, $5, 0.95, 1)
-                """, org_id, plant_id, doc_uuid, f"Table {table['table_id']}", table_str)
+                    VALUES ($1, $2, $3, NULL, 'TABLE', $4, $5, 0.95, $6)
+                """, org_id, plant_id, doc_uuid, f"Table {table['table_id']}", table_str, table.get("page_no", 1))

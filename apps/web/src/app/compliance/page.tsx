@@ -25,13 +25,13 @@ import {
 } from 'lucide-react';
 
 export default function ComplianceAuditPage() {
-  const { complianceGaps, certificates, resolveGap } = useData();
-  const [activeTab, setActiveTab] = useState<'gaps' | 'certificates'>('gaps');
+  const { complianceGaps, resolveGap, refreshComplianceGaps } = useData();
   const [severityFilter, setSeverityFilter] = useState('All');
   const [statusFilter, setStatusFilter] = useState('Open');
   const [session, setSession] = useState<PlantBrainSession | null>(null);
   const [sessionLoaded, setSessionLoaded] = useState(false);
   const [scanBusy, setScanBusy] = useState(false);
+  const [resolvingId, setResolvingId] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState('');
 
   useEffect(() => {
@@ -46,7 +46,10 @@ export default function ComplianceAuditPage() {
 
   // Counts
   const openGapsCount = complianceGaps.filter(g => g.status === 'Open').length;
-  const expiredCertsCount = certificates.filter(c => c.status === 'Expired' || c.status === 'Overdue').length;
+  const closedGapsCount = complianceGaps.filter(g => g.status === 'Closed').length;
+  const auditScore = complianceGaps.length > 0
+    ? Math.round((closedGapsCount / complianceGaps.length) * 100)
+    : 100;
   const filteredGaps = complianceGaps.filter(gap => {
     const matchesSeverity = severityFilter === 'All' || gap.severity === severityFilter;
     const matchesStatus = statusFilter === 'All' || gap.status === statusFilter;
@@ -67,11 +70,30 @@ export default function ComplianceAuditPage() {
       if (!res.ok) {
         throw new Error(await readApiError(res, 'Unable to run compliance scan'));
       }
-      setActionMessage('Compliance scan completed. Refresh gap data from the API to inspect newly detected evidence conflicts.');
+      await refreshComplianceGaps();
+      setActionMessage('Compliance scan completed. Newly detected evidence conflicts are now reflected below.');
     } catch (error) {
       setActionMessage(error instanceof Error ? error.message : 'Unable to run compliance scan');
     } finally {
       setScanBusy(false);
+    }
+  };
+
+  const handleResolveGap = async (gapId: string) => {
+    setActionMessage('');
+
+    if (!canResolveGap) {
+      setActionMessage(getDeniedMessage(session?.role, 'resolve_compliance_gap'));
+      return;
+    }
+
+    setResolvingId(gapId);
+    try {
+      await resolveGap(gapId);
+    } catch (error) {
+      setActionMessage(error instanceof Error ? error.message : 'Unable to resolve compliance gap');
+    } finally {
+      setResolvingId(null);
     }
   };
 
@@ -81,7 +103,7 @@ export default function ComplianceAuditPage() {
       setActionMessage(getDeniedMessage(session?.role, 'export_reports'));
       return;
     }
-    exportComplianceCsv(activeTab, filteredGaps, certificates);
+    exportComplianceCsv(filteredGaps);
   };
 
   if (!sessionLoaded) {
@@ -129,12 +151,12 @@ export default function ComplianceAuditPage() {
           </div>
 
           <div className="glass-panel p-4 rounded-xl flex items-center gap-4">
-            <div className="p-3 bg-amber-500/10 text-cyber-amber rounded-lg border border-cyber-amber/20">
-              <Award className="w-5 h-5" />
+            <div className="p-3 bg-emerald-500/10 text-cyber-emerald rounded-lg border border-cyber-emerald/20">
+              <FileCheck className="w-5 h-5" />
             </div>
             <div>
-              <span className="text-[10px] text-slate-500 font-mono uppercase tracking-wider block">Expired Certificates</span>
-              <span className="text-xl font-bold text-white">{expiredCertsCount} Certificates</span>
+              <span className="text-[10px] text-slate-500 font-mono uppercase tracking-wider block">Resolved Gaps</span>
+              <span className="text-xl font-bold text-white">{closedGapsCount} Closed</span>
             </div>
           </div>
 
@@ -144,9 +166,7 @@ export default function ComplianceAuditPage() {
             </div>
             <div>
               <span className="text-[10px] text-slate-500 font-mono uppercase tracking-wider block">Compliance Audit Score</span>
-              <span className="text-xl font-bold text-white">
-                {Math.round(((certificates.filter(c => c.status === 'Active').length + complianceGaps.filter(g => g.status === 'Closed').length) / (certificates.length + complianceGaps.length)) * 100)}%
-              </span>
+              <span className="text-xl font-bold text-white">{auditScore}%</span>
             </div>
           </div>
         </div>
@@ -175,33 +195,15 @@ export default function ComplianceAuditPage() {
           </div>
         )}
 
-        {/* Tab Selection */}
+        {/* Regulatory Gaps */}
         <div className="flex border-b border-slate-800 pb-px">
-          <button
-            onClick={() => setActiveTab('gaps')}
-            className={`px-6 py-3 font-semibold text-xs uppercase tracking-wider transition-all border-b-2 -mb-px ${
-              activeTab === 'gaps'
-                ? 'text-cyber-emerald border-cyber-emerald bg-emerald-500/5'
-                : 'text-slate-500 hover:text-slate-300 border-transparent'
-            }`}
-          >
+          <span className="px-6 py-3 font-semibold text-xs uppercase tracking-wider text-cyber-emerald border-b-2 border-cyber-emerald bg-emerald-500/5 -mb-px">
             Regulatory Gaps ({openGapsCount})
-          </button>
-          <button
-            onClick={() => setActiveTab('certificates')}
-            className={`px-6 py-3 font-semibold text-xs uppercase tracking-wider transition-all border-b-2 -mb-px ${
-              activeTab === 'certificates'
-                ? 'text-cyber-emerald border-cyber-emerald bg-emerald-500/5'
-                : 'text-slate-500 hover:text-slate-300 border-transparent'
-            }`}
-          >
-            Certificates Registry ({certificates.length})
-          </button>
+          </span>
         </div>
 
-        {/* Tabs Content */}
-        {activeTab === 'gaps' ? (
-          <div className="glass-panel p-6 rounded-2xl border-slate-800/80 space-y-4">
+        {/* Gaps Content */}
+        <div className="glass-panel p-6 rounded-2xl border-slate-800/80 space-y-4">
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-4">
               <div>
                 <h3 className="text-base font-bold text-white tracking-wide">Regulatory Gaps Inventory</h3>
@@ -291,18 +293,12 @@ export default function ComplianceAuditPage() {
                       <div className="shrink-0 flex items-center gap-2">
                         {isOpen ? (
                           <button
-                            onClick={() => {
-                              if (!canResolveGap) {
-                                setActionMessage(getDeniedMessage(session?.role, 'resolve_compliance_gap'));
-                                return;
-                              }
-                              resolveGap(gap.id);
-                            }}
-                            disabled={!canResolveGap}
+                            onClick={() => handleResolveGap(gap.id)}
+                            disabled={!canResolveGap || resolvingId === gap.id}
                             title={!canResolveGap ? getDeniedMessage(session?.role, 'resolve_compliance_gap') : undefined}
                             className="px-3 py-1.5 bg-cyber-emerald hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed active:bg-emerald-700 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1 transition-all hover:shadow-[0_0_15px_rgba(16,185,129,0.2)]"
                           >
-                            <Check className="w-3.5 h-3.5" /> Resolve Gap
+                            <Check className="w-3.5 h-3.5" /> {resolvingId === gap.id ? 'Resolving...' : 'Resolve Gap'}
                           </button>
                         ) : (
                           <span className="text-[10px] text-cyber-emerald font-mono font-semibold bg-emerald-500/10 px-2.5 py-1 rounded-full border border-emerald-500/20 flex items-center gap-1">
@@ -320,118 +316,32 @@ export default function ComplianceAuditPage() {
               )}
             </div>
           </div>
-        ) : (
-          <div className="glass-panel p-6 rounded-2xl border-slate-800/80 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
-              <div>
-                <h3 className="text-base font-bold text-white tracking-wide">Certificates Registry</h3>
-                <p className="text-xs text-slate-400 mt-0.5">Track regulatory pressure testing, loops calibration, and thick gauges checks</p>
-              </div>
-              <button
-                onClick={handleExport}
-                disabled={!canExportReports}
-                title={!canExportReports ? getDeniedMessage(session?.role, 'export_reports') : undefined}
-                className="px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed border border-slate-700 text-slate-300 hover:text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all self-start sm:self-auto"
-              >
-                <FileDown className="w-3.5 h-3.5" /> Export CSV
-              </button>
-            </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="border-b border-slate-800/80 text-[10px] font-mono text-slate-500 uppercase tracking-widest">
-                    <th className="py-3 px-4">Certificate Name</th>
-                    <th className="py-3 px-4">Associated Asset</th>
-                    <th className="py-3 px-4">Expiry Date</th>
-                    <th className="py-3 px-4 text-center">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800/40 text-xs">
-                  {certificates.length > 0 ? (
-                    certificates.map((cert) => {
-                      const isExpired = cert.status === 'Expired' || cert.status === 'Overdue';
-                      return (
-                        <tr key={cert.id} className="hover:bg-slate-800/10 transition-colors">
-                          <td className="py-4 px-4 font-semibold text-slate-200">
-                            <div className="flex items-center gap-2.5">
-                              <Award className={`w-4 h-4 ${isExpired ? 'text-cyber-rose' : 'text-cyber-emerald'}`} />
-                              {cert.name}
-                            </div>
-                          </td>
-                          <td className="py-4 px-4 font-mono">
-                            <Link
-                              href={`/assets/${cert.assetTag}`}
-                              className="bg-slate-900/60 border border-slate-800 px-2 py-0.5 rounded text-[10px] hover:text-cyber-emerald transition-colors uppercase font-bold"
-                            >
-                              {cert.assetTag}
-                            </Link>
-                          </td>
-                          <td className="py-4 px-4 font-mono text-slate-400">{cert.expiryDate}</td>
-                          <td className="py-4 px-4 text-center whitespace-nowrap">
-                            <span className={`text-[10px] font-mono font-bold uppercase border px-2.5 py-0.5 rounded-full ${
-                              cert.status === 'Expired' ? 'bg-cyber-rose/10 text-cyber-rose border-cyber-rose/20' :
-                              cert.status === 'Overdue' ? 'bg-cyber-amber/10 text-cyber-amber border-cyber-amber/20' :
-                              'bg-cyber-emerald/10 text-cyber-emerald border-cyber-emerald/20'
-                            }`}>
-                              {cert.status}
-                            </span>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  ) : (
-                    <tr>
-                      <td colSpan={4} className="py-12 text-center text-slate-500 font-mono text-xs">
-                        No certificates registry matches found.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
 
       </div>
     </NavigationShell>
   );
 }
 
-function exportComplianceCsv(
-  activeTab: 'gaps' | 'certificates',
-  gaps: ReturnType<typeof useData>['complianceGaps'],
-  certificates: ReturnType<typeof useData>['certificates'],
-) {
+function exportComplianceCsv(gaps: ReturnType<typeof useData>['complianceGaps']) {
   const stamp = new Date().toISOString().slice(0, 10);
-  const content = activeTab === 'gaps'
-    ? [
-        'asset_tag,gap_type,severity,status,description,evidence_document_id,created_at',
-        ...gaps.map(gap => [
-          gap.assetTag,
-          gap.gapType,
-          gap.severity,
-          gap.status,
-          gap.description,
-          gap.evidenceDocId || '',
-          gap.createdAt,
-        ].map(csvEscape).join(',')),
-      ].join('\n')
-    : [
-        'asset_tag,certificate_name,expiry_date,status',
-        ...certificates.map(cert => [
-          cert.assetTag,
-          cert.name,
-          cert.expiryDate,
-          cert.status,
-        ].map(csvEscape).join(',')),
-      ].join('\n');
+  const content = [
+    'asset_tag,gap_type,severity,status,description,evidence_document_id,created_at',
+    ...gaps.map(gap => [
+      gap.assetTag,
+      gap.gapType,
+      gap.severity,
+      gap.status,
+      gap.description,
+      gap.evidenceDocId || '',
+      gap.createdAt,
+    ].map(csvEscape).join(',')),
+  ].join('\n');
 
   const blob = new Blob([content], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = `compliance_${activeTab}_${stamp}.csv`;
+  link.download = `compliance_gaps_${stamp}.csv`;
   link.click();
   URL.revokeObjectURL(url);
 }

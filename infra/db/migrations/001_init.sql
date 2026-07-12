@@ -31,7 +31,9 @@ create table if not exists identity.plants (
 
 create table if not exists identity.users (
   id uuid primary key default gen_random_uuid(),
-  organization_id uuid not null references identity.organizations(id),
+  -- Nullable so BetterAuth email/password signup can create the user row first; the
+  -- auth after-signup hook immediately assigns the organization + membership + role.
+  organization_id uuid references identity.organizations(id),
   name text not null,
   email text not null unique,
   email_verified boolean not null default false,
@@ -61,6 +63,10 @@ create table if not exists identity.accounts (
   refresh_token text,
   id_token text,
   expires_at timestamptz,
+  -- BetterAuth account fields (credential provider leaves token/expiry columns null)
+  access_token_expires_at timestamptz,
+  refresh_token_expires_at timestamptz,
+  scope text,
   password text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -102,6 +108,7 @@ create table if not exists document.documents (
   current_version_id uuid,
   status text not null default 'UPLOADED',
   uploaded_by uuid,
+  metadata_json jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint documents_access_level_check check (access_level in ('public', 'internal', 'restricted', 'confidential')),
@@ -193,10 +200,13 @@ create table if not exists ingestion.document_chunks (
   created_at timestamptz not null default now()
 );
 
+-- HNSW, not ivfflat: ivfflat needs training data and, with lists=100 on a small
+-- table, an `ORDER BY embedding <=> $1 LIMIT k` probes a single (often empty) cluster
+-- and returns 0 rows — silently breaking retrieval at demo scale. HNSW needs no
+-- training and gives near-exact recall at any size.
 create index if not exists document_chunks_embedding_idx
   on ingestion.document_chunks
-  using ivfflat (embedding vector_cosine_ops)
-  with (lists = 100);
+  using hnsw (embedding vector_cosine_ops);
 
 create index if not exists document_chunks_metadata_idx
   on ingestion.document_chunks

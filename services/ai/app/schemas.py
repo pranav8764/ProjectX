@@ -18,6 +18,9 @@ class CopilotQueryRequest(BaseModel):
 class RCAGenerateRequest(BaseModel):
     assetTag: str
     failureDescription: str
-    plantId: Optional[str] = None
+    # plantId is mandatory: with it omitted the evidence query used to match
+    # documents across every tenant in the database.
+    plantId: str
     userId: Optional[str] = None
     organizationId: Optional[str] = None
+    userRole: Optional[str] = None

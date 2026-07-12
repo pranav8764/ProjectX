@@ -70,27 +70,12 @@ async def rag_query(request: CopilotQueryRequest):
             "validation_errors": []
         }
 
-        # Resolve LangGraph Checkpointer
-        from langgraph.checkpoint.memory import MemorySaver
-        from app.graph import compile_copilot_graph
-        
-        checkpointer = None
-        if database.psycopg_pool:
-            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-            try:
-                saver = AsyncPostgresSaver(database.psycopg_pool)
-                # Call setup once to prepare checkpoints schema tables
-                await saver.setup()
-                checkpointer = saver
-                logger.info("Using stateful PostgreSQL checkpointer for thread session")
-            except Exception as pg_err:
-                logger.warning(f"Failed to initialize PostgreSQL checkpointer: {pg_err}. Falling back to MemorySaver.")
-                checkpointer = MemorySaver()
-        else:
-            checkpointer = MemorySaver()
+        # Use the graph compiled once at startup; compile lazily only if startup was skipped.
+        import app.graph as graph_module
+        graph = graph_module.copilot_graph
+        if graph is None:
+            graph = await graph_module.init_copilot_graph()
 
-        # Compile and execute Graph
-        graph = compile_copilot_graph(checkpointer=checkpointer)
         state_result = await graph.ainvoke(inputs, config=config)
 
         # Extract final outputs

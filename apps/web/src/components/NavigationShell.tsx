@@ -21,7 +21,7 @@ import {
   Lock,
   AlertTriangle,
 } from 'lucide-react';
-import { API_FORBIDDEN_EVENT, clearStoredSession, getStoredSession, PlantBrainSession } from '../lib/api';
+import { API_FORBIDDEN_EVENT, apiFetch, clearStoredSession, getStoredSession, PlantBrainSession } from '../lib/api';
 import { canAccessPath, getDeniedMessage, getRoleLabel, getRouteAction } from '../lib/permissions';
 
 interface NavigationShellProps {
@@ -47,6 +47,21 @@ export default function NavigationShell({ children }: NavigationShellProps) {
   const [loading, setLoading] = useState(true);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [accessNotice, setAccessNotice] = useState('');
+  const [gatewayOnline, setGatewayOnline] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      const res = await apiFetch('/api/me').catch(() => null);
+      if (!cancelled) setGatewayOnline(Boolean(res?.ok));
+    };
+    check();
+    const interval = setInterval(check, 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     const session = getStoredSession();
@@ -212,9 +227,11 @@ export default function NavigationShell({ children }: NavigationShellProps) {
 
           <div className="hidden sm:flex items-center gap-4 lg:gap-6 text-[10px] lg:text-xs text-slate-400 font-mono">
             <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-cyber-emerald animate-ping" />
+              <span className={`w-2 h-2 rounded-full ${gatewayOnline === false ? 'bg-red-500' : gatewayOnline ? 'bg-cyber-emerald animate-ping' : 'bg-slate-500'}`} />
               <span>
-                Gateway: <span className="text-cyber-emerald font-bold">Online</span>
+                Gateway: <span className={`font-bold ${gatewayOnline === false ? 'text-red-400' : gatewayOnline ? 'text-cyber-emerald' : 'text-slate-400'}`}>
+                  {gatewayOnline === null ? 'Checking…' : gatewayOnline ? 'Online' : 'Offline'}
+                </span>
               </span>
             </div>
             <div className="hidden md:block h-4 w-px bg-slate-800" />

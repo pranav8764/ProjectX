@@ -35,11 +35,16 @@ def optional_uuid(value: Optional[str]) -> Optional[uuid.UUID]:
     except (TypeError, ValueError):
         return None
 
+def normalize_asset_tag(tag: str) -> str:
+    """Canonical asset-tag form shared by ingestion and query: uppercase, whitespace
+    collapsed to a single dash, so 'P 101', 'p-101' and 'P  101' all become 'P-101'."""
+    return re.sub(r"[\s_]+", "-", str(tag or "").upper().strip()).strip("-")
+
 def extract_asset_tags(text: str) -> List[str]:
     seen = set()
     tags = []
     for match in re.finditer(r"\b(?!(?:VERSION|PAGE|REV|TABLE|FIG|FIGURE)\b)[A-Z]+[-\s]*\d+[A-Z]*\b", text.upper()):
-        tag = re.sub(r"\s+", "-", match.group()).strip("-")
+        tag = normalize_asset_tag(match.group())
         if tag and tag not in seen:
             seen.add(tag)
             tags.append(tag)

@@ -39,3 +39,7 @@ data/uploads/*
 postgres-data/
 redis-data/
 minio-data/
+
+# build artifacts
+services/api/server
+apps/web/tsconfig.tsbuildinfo
