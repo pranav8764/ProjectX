@@ -2,7 +2,7 @@
 
 import React, { Suspense, useState, useEffect, useRef } from 'react';
 import NavigationShell from '../../components/NavigationShell';
-import { queryCopilot, CopilotResponse } from '../../lib/mockData';
+import { CopilotResponse } from '../../lib/mockData';
 import { apiFetch, getStoredSession, PlantBrainSession, readApiError } from '../../lib/api';
 import { recordQueryAnswer } from '../../lib/query-history';
 import { useData } from '../../context/DataContext';
@@ -177,22 +177,26 @@ function CopilotPageContent() {
       recordQueryAnswer(textToSend, data, assetFilter);
 
     } catch (err) {
-      // Fallback to offline RAG mock engine
-      setTimeout(() => {
-        const mockRes = queryCopilot(textToSend, assetFilter);
-        setMessages(prev => prev.map(m => {
-          if (m.id === assistantMessageId) {
-            return {
-              ...m,
-              text: mockRes.answer,
-              loading: false,
-              response: mockRes
-            };
-          }
-          return m;
-        }));
-        recordQueryAnswer(textToSend, mockRes, assetFilter);
-      }, 1000);
+      // No silent mock answers: a fabricated response with fake citations would
+      // violate the AI-safety rule against unsupported answers. Surface the error.
+      const message = err instanceof Error ? err.message : 'The Copilot backend is unreachable.';
+      setMessages(prev => prev.map(m => {
+        if (m.id === assistantMessageId) {
+          return {
+            ...m,
+            text: `Unable to reach the Copilot service. ${message} Please try again once the AI service is available.`,
+            loading: false,
+            response: {
+              answer: `Unable to reach the Copilot service. ${message}`,
+              confidence: 0,
+              citations: [],
+              relatedAssets: [],
+              missingInfo: ['The AI backend did not respond. No answer can be shown without evidence.'],
+            },
+          };
+        }
+        return m;
+      }));
     }
   };
 
@@ -502,9 +506,9 @@ function CopilotPageContent() {
             )}
           </div>
           
-          {activeResponse && (
+          {activeResponse && typeof activeResponse.confidence === 'number' && (
             <div className="border-t border-slate-800/80 pt-4 text-[10px] text-slate-500 font-mono text-center">
-              Evaluation Metrics: CRAG Faithfulness Verified
+              Answer confidence: {(activeResponse.confidence * 100).toFixed(0)}% · {activeResponse.citations?.length || 0} cited source(s)
             </div>
           )}
         </div>

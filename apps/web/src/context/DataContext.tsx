@@ -1,18 +1,18 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { 
-  Document, 
-  Asset, 
-  ComplianceGap, 
-  Certificate, 
-  INITIAL_DOCUMENTS, 
-  INITIAL_ASSETS, 
-  INITIAL_COMPLIANCE_GAPS, 
-  INITIAL_CERTIFICATES 
+import {
+  Document,
+  Asset,
+  ComplianceGap,
+  FailureEvent,
+  INITIAL_DOCUMENTS,
+  INITIAL_ASSETS,
+  INITIAL_COMPLIANCE_GAPS
 } from '../lib/mockData';
 import { apiFetch, appendPlantQuery, getPlantId, getStoredSession, mergeStoredSession, readApiError } from '../lib/api';
 import {
+  isDocumentTerminalStatus,
   normalizeCriticality,
   normalizeDocumentStatus,
   normalizeDocumentType,
@@ -44,13 +44,13 @@ interface DataContextType {
   documents: Document[];
   assets: Asset[];
   complianceGaps: ComplianceGap[];
-  certificates: Certificate[];
   uploadDocument: (file: File, type: string, metadata?: UploadMetadata) => Promise<void>;
   uploadDocumentVersion: (documentId: string, file: File, metadata?: Pick<UploadMetadata, 'title' | 'version'>) => Promise<void>;
   retryDocumentProcessing: (documentId: string) => Promise<void>;
-  refreshDocumentStatus: (documentId: string) => Promise<void>;
+  refreshDocumentStatus: (documentId: string) => Promise<Document['status'] | undefined>;
   archiveDocument: (documentId: string) => Promise<void>;
-  resolveGap: (gapId: string) => void;
+  resolveGap: (gapId: string) => Promise<void>;
+  refreshComplianceGaps: () => Promise<void>;
   addFailureEvent: (assetTag: string, description: string, severity: 'Low' | 'Medium' | 'High' | 'Critical') => void;
 }
 
@@ -60,19 +60,16 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [documents, setDocuments] = useState<Document[]>(INITIAL_DOCUMENTS);
   const [assets, setAssets] = useState<Asset[]>(INITIAL_ASSETS);
   const [complianceGaps, setComplianceGaps] = useState<ComplianceGap[]>(INITIAL_COMPLIANCE_GAPS);
-  const [certificates, setCertificates] = useState<Certificate[]>(INITIAL_CERTIFICATES);
 
   // Load state from localStorage on mount (client side)
   useEffect(() => {
     const savedDocs = localStorage.getItem('plantbrain_documents');
     const savedAssets = localStorage.getItem('plantbrain_assets');
     const savedGaps = localStorage.getItem('plantbrain_compliance_gaps');
-    const savedCerts = localStorage.getItem('plantbrain_certificates');
 
     safelyHydrate(savedDocs, setDocuments);
     safelyHydrate(savedAssets, setAssets);
     safelyHydrate(savedGaps, setComplianceGaps);
-    safelyHydrate(savedCerts, setCertificates);
 
     let cancelled = false;
 
@@ -158,7 +155,6 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (assetsRes.ok) {
         const apiAssets = await assetsRes.json();
         const nextAssets = apiAssets.map((asset: any): Asset => {
-          const existing = INITIAL_ASSETS.find(a => a.assetTag === asset.assetTag);
           const linkedDocuments = (loadedDocuments || documents)
             .filter(doc => doc.title.toUpperCase().includes(asset.assetTag))
             .map(doc => doc.id);
@@ -166,17 +162,29 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
             .filter(gap => gap.assetTag === asset.assetTag)
             .map(gap => gap.id);
 
+          const failures: FailureEvent[] = Array.isArray(asset.failures)
+            ? asset.failures.map((failure: any): FailureEvent => ({
+                id: failure.id,
+                date: failure.createdAt?.split('T')[0] || failure.date || new Date().toISOString().split('T')[0],
+                description: failure.failureSummary || failure.description || '',
+                severity: normalizeSeverity(failure.severity),
+                status: failure.status || 'Open',
+                workOrder: failure.workOrder || '—',
+                maintenanceAction: (failure.recommendations || []).join(', ') || failure.maintenanceAction || 'Review RCA recommendations',
+              }))
+            : [];
+
           return {
             id: asset.id,
             assetTag: asset.assetTag,
-            assetName: asset.assetName || existing?.assetName || asset.assetTag,
-            assetType: asset.assetType || existing?.assetType || 'Asset',
-            location: asset.location || existing?.location || 'Plant',
-            criticality: normalizeCriticality(asset.criticality || existing?.criticality),
-            riskScore: Number(asset.riskScore || existing?.riskScore || 50),
-            failures: existing?.failures || [],
-            documents: linkedDocuments.length > 0 ? linkedDocuments : existing?.documents || [],
-            complianceGaps: linkedGaps.length > 0 ? linkedGaps : existing?.complianceGaps || [],
+            assetName: asset.assetName || asset.assetTag,
+            assetType: asset.assetType || 'Asset',
+            location: asset.location || 'Plant',
+            criticality: normalizeCriticality(asset.criticality),
+            riskScore: Number(asset.riskScore || 50),
+            failures,
+            documents: linkedDocuments,
+            complianceGaps: linkedGaps,
           };
         });
         setAssets(nextAssets);
@@ -193,11 +201,10 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   // Save state helper
-  const saveState = (docs: Document[], asts: Asset[], gaps: ComplianceGap[], certs: Certificate[]) => {
+  const saveState = (docs: Document[], asts: Asset[], gaps: ComplianceGap[]) => {
     localStorage.setItem('plantbrain_documents', JSON.stringify(docs));
     localStorage.setItem('plantbrain_assets', JSON.stringify(asts));
     localStorage.setItem('plantbrain_compliance_gaps', JSON.stringify(gaps));
-    localStorage.setItem('plantbrain_certificates', JSON.stringify(certs));
   };
 
   const uploadDocumentVersion = async (documentId: string, file: File, metadata: Pick<UploadMetadata, 'title' | 'version'> = {}) => {
@@ -256,7 +263,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
             }
           : doc
       ));
-      saveState(nextDocs, assets, complianceGaps, certificates);
+      saveState(nextDocs, assets, complianceGaps);
       return nextDocs;
     });
   };
@@ -297,7 +304,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const updatedDocs = [newDoc, ...documents];
     setDocuments(updatedDocs);
-    saveState(updatedDocs, assets, complianceGaps, certificates);
+    saveState(updatedDocs, assets, complianceGaps);
 
     const formData = new FormData();
     formData.append('file', file);
@@ -309,6 +316,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (metadata.version) formData.append('version', metadata.version);
     if (metadata.assetTag) formData.append('assetTag', metadata.assetTag.toUpperCase());
 
+    let uploadSucceeded = false;
     try {
       const res = await apiFetch('/api/documents/upload', {
         method: 'POST',
@@ -316,6 +324,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
 
       if (res.ok) {
+        uploadSucceeded = true;
         const uploaded = await res.json();
         activeDocId = uploaded.documentId || newDocId;
         setDocuments(prevDocs => {
@@ -342,80 +351,59 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
                   }
               : d
           ));
-          saveState(nextDocs, assets, complianceGaps, certificates);
+          saveState(nextDocs, assets, complianceGaps);
           return nextDocs;
         });
+      } else {
+        throw new Error(await readApiError(res, 'Upload failed'));
       }
-    } catch {
-      // Keep the local ingestion simulator below for offline demos.
+    } catch (error) {
+      // Real upload failed: mark the document FAILED with the real reason instead of
+      // faking a successful pipeline. No client-side simulation of processing.
+      setDocuments(prevDocs => {
+        const nextDocs = prevDocs.map(d => (
+          d.id === newDocId
+            ? {
+                ...d,
+                status: 'FAILED' as Document['status'],
+                processingStatus: 'FAILED',
+                processingError: error instanceof Error ? error.message : 'Upload failed. The backend is unreachable.',
+              }
+            : d
+        ));
+        saveState(nextDocs, assets, complianceGaps);
+        return nextDocs;
+      });
+      return;
     }
 
-    // Simulate Background Ingestion Pipeline
-    const statuses: Array<Document['status']> = [
-      'EXTRACTING_TEXT',
-      'OCR_RUNNING',
-      'CLASSIFYING',
-      'CHUNKING',
-      'EXTRACTING_ENTITIES',
-      'GENERATING_EMBEDDINGS',
-      'BUILDING_GRAPH',
-      'COMPLETED'
-    ];
-
-    let currentStatusIndex = 0;
-
-    const interval = setInterval(() => {
-      if (currentStatusIndex < statuses.length) {
-        const nextStatus = statuses[currentStatusIndex];
-        setDocuments(prevDocs => {
-          const nextDocs = prevDocs.map(d => {
-            if (d.id === newDocId) {
-              const updatedDoc = { 
-                ...d, 
-                status: nextStatus,
-                ocrConfidence: nextStatus === 'COMPLETED' ? 0.95 : d.ocrConfidence,
-                classificationConfidence: nextStatus === 'COMPLETED' ? 0.92 : d.classificationConfidence
-              };
-              return updatedDoc;
-            }
-            if (d.id === activeDocId) {
-              return {
-                ...d,
-                status: nextStatus,
-                ocrConfidence: nextStatus === 'COMPLETED' ? 0.95 : d.ocrConfidence,
-                classificationConfidence: nextStatus === 'COMPLETED' ? 0.92 : d.classificationConfidence
-              };
-            }
-            return d;
-          });
-          saveState(nextDocs, assets, complianceGaps, certificates);
-          return nextDocs;
-        });
-        currentStatusIndex++;
-      } else {
-        clearInterval(interval);
-        
-        // After completion, if the document mentions an asset tag like P-101, link it
-        // Check for tags in document title
-        const detectedTag = detectedAssetTags[0];
-        if (detectedTag) {
-          setAssets(prevAssets => {
-            const nextAssets = prevAssets.map(a => {
-              if (a.assetTag === detectedTag && !a.documents.includes(activeDocId)) {
-                return { ...a, documents: [...a.documents, activeDocId] };
-              }
-              return a;
-            });
-            saveState(documents, nextAssets, complianceGaps, certificates);
-            return nextAssets;
-          });
-        }
-      }
-    }, 1200);
+    // Poll the real backend for processing status until the pipeline reaches a
+    // terminal state. This replaces the previous client-side simulation, which
+    // displayed fabricated progress and confidence even for failed documents.
+    if (uploadSucceeded && activeDocId && !activeDocId.startsWith('doc_')) {
+      await pollDocumentStatus(activeDocId);
+    }
   };
 
-  const refreshDocumentStatus = async (documentId: string) => {
-    if (documentId.startsWith('doc_')) return;
+  const pollDocumentStatus = async (documentId: string) => {
+    const maxAttempts = 150; // ~5 min at 2s intervals
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      let current: Document['status'] | undefined;
+      try {
+        current = await refreshDocumentStatus(documentId);
+      } catch {
+        // transient error; keep polling until timeout
+        continue;
+      }
+      if (current && isDocumentTerminalStatus(current)) {
+        return;
+      }
+    }
+  };
+
+  const refreshDocumentStatus = async (documentId: string): Promise<Document['status'] | undefined> => {
+    if (documentId.startsWith('doc_')) return undefined;
 
     const res = await apiFetch(`/api/documents/${encodeURIComponent(documentId)}/status`);
     if (!res.ok) {
@@ -423,6 +411,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     const status = await res.json();
+    const normalizedStatus = normalizeDocumentStatus(status.status);
     setDocuments(prevDocs => {
       const nextDocs = prevDocs.map(doc => (
         doc.id === documentId
@@ -440,9 +429,10 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
             }
           : doc
       ));
-      saveState(nextDocs, assets, complianceGaps, certificates);
+      saveState(nextDocs, assets, complianceGaps);
       return nextDocs;
     });
+    return normalizedStatus;
   };
 
   const retryDocumentProcessing = async (documentId: string) => {
@@ -466,7 +456,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
               }
             : doc
         ));
-        saveState(nextDocs, assets, complianceGaps, certificates);
+        saveState(nextDocs, assets, complianceGaps);
         return nextDocs;
       });
       return;
@@ -496,7 +486,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
             }
           : doc
       ));
-      saveState(nextDocs, assets, complianceGaps, certificates);
+      saveState(nextDocs, assets, complianceGaps);
       return nextDocs;
     });
   };
@@ -518,30 +508,50 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }
 
-    setDocuments(prevDocs => {
-      const nextDocs = prevDocs.filter(doc => doc.id !== documentId);
-      saveState(nextDocs, assets, complianceGaps, certificates);
-      return nextDocs;
-    });
-    setAssets(prevAssets => {
-      const nextAssets = prevAssets.map(asset => ({
-        ...asset,
-        documents: asset.documents.filter(id => id !== documentId),
-      }));
-      saveState(documents.filter(doc => doc.id !== documentId), nextAssets, complianceGaps, certificates);
-      return nextAssets;
-    });
+    const nextDocuments = documents.filter(doc => doc.id !== documentId);
+    const nextAssets = assets.map(asset => ({
+      ...asset,
+      documents: asset.documents.filter(id => id !== documentId),
+    }));
+    setDocuments(nextDocuments);
+    setAssets(nextAssets);
+    saveState(nextDocuments, nextAssets, complianceGaps);
   };
 
-  const resolveGap = (gapId: string) => {
-    const updatedGaps = complianceGaps.map(g => {
-      if (g.id === gapId) {
-        return { ...g, status: 'Closed' as const };
-      }
-      return g;
+  const resolveGap = async (gapId: string): Promise<void> => {
+    const res = await apiFetch(`/api/compliance/gaps/${encodeURIComponent(gapId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'CLOSED' }),
     });
+    if (!res.ok) {
+      throw new Error(await readApiError(res, 'Unable to resolve gap'));
+    }
+    const updatedGaps = complianceGaps.map(g => (
+      g.id === gapId ? { ...g, status: 'Closed' as const } : g
+    ));
     setComplianceGaps(updatedGaps);
-    saveState(documents, assets, updatedGaps, certificates);
+    saveState(documents, assets, updatedGaps);
+  };
+
+  const refreshComplianceGaps = async (): Promise<void> => {
+    const res = await apiFetch('/api/compliance/gaps');
+    if (!res.ok) {
+      throw new Error(await readApiError(res, 'Unable to refresh compliance gaps'));
+    }
+    const apiGaps = await res.json();
+    const nextGaps = apiGaps.map((gap: any): ComplianceGap => ({
+      id: gap.id,
+      assetTag: gap.assetTag || 'UNKNOWN',
+      gapType: normalizeDocumentType(gap.gapType || 'Compliance Gap'),
+      description: gap.description,
+      severity: normalizeSeverity(gap.severity),
+      evidenceDocId: gap.evidenceDocumentId,
+      status: normalizeGapStatus(gap.status),
+      createdAt: gap.createdAt,
+    }));
+    setComplianceGaps(nextGaps);
+    saveState(documents, assets, nextGaps);
   };
 
   const addFailureEvent = (assetTag: string, description: string, severity: 'Low' | 'Medium' | 'High' | 'Critical') => {
@@ -566,21 +576,21 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     });
 
     setAssets(updatedAssets);
-    saveState(documents, updatedAssets, complianceGaps, certificates);
+    saveState(documents, updatedAssets, complianceGaps);
   };
 
   return (
-    <DataContext.Provider value={{ 
-      documents, 
-      assets, 
-      complianceGaps, 
-      certificates, 
-      uploadDocument, 
+    <DataContext.Provider value={{
+      documents,
+      assets,
+      complianceGaps,
+      uploadDocument,
       uploadDocumentVersion,
       retryDocumentProcessing,
       refreshDocumentStatus,
       archiveDocument,
       resolveGap,
+      refreshComplianceGaps,
       addFailureEvent
     }}>
       {children}

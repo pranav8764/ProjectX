@@ -1,11 +1,14 @@
 x-service-env: &service-env
-  DATABASE_URL: postgresql://${POSTGRES_USER:?Set POSTGRES_USER}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?Set POSTGRES_DB}
+  # Single source of truth for the database. Point this at your Supabase session-pooler
+  # URL (port 5432, NOT the 6543 transaction pooler — asyncpg/LangGraph need prepared
+  # statements), or at the bundled local Postgres via the `local-db` profile.
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL (Supabase session-pooler URL, or the local-db value from .env.example)}
   REDIS_URL: redis://redis:6379
   STORAGE_PROVIDER: minio
   S3_ENDPOINT: http://minio:9000
   S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
   S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
-  STORAGE_BUCKET: ${STORAGE_BUCKET:?Set STORAGE_BUCKET}
+  STORAGE_BUCKET: ${STORAGE_BUCKET:-plantbrain-documents}
   AI_SERVICE_URL: http://ai:8000
   LOG_LEVEL: info
   APP_ENV: development
@@ -13,24 +16,39 @@ x-service-env: &service-env
   CORS_ALLOWED_ORIGINS: http://localhost:3000
 
 services:
+  # Local Postgres for offline development. Disabled by default so the stack targets
+  # DATABASE_URL (e.g. Supabase). Enable with: docker compose --profile local-db up
   postgres:
     image: pgvector/pgvector:pg16
     container_name: plantbrain-postgres
+    profiles: ["local-db"]
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-plantbrain}
+      POSTGRES_USER: ${POSTGRES_USER:-plantbrain}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-plantbrain}
     ports:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/db/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-plantbrain} -d ${POSTGRES_DB:-plantbrain}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     container_name: plantbrain-redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
 
   minio:
     image: minio/minio:latest
@@ -44,6 +62,12 @@ services:
       - "9001:9001"
     volumes:
       - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
 
   api:
     build:
@@ -52,7 +76,10 @@ services:
     environment:
       <<: *service-env
       PORT: 8080
-      S3_ENDPOINT: minio:9000 # inside docker network
+      S3_ENDPOINT: minio:9000 # in-network endpoint used for uploads/bucket ops
+      # Browser-reachable endpoint used only for presigning download URLs. The signed
+      # host must resolve from the user's browser, which `minio` (docker DNS) does not.
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
       API_RATE_LIMIT: 300
       API_RATE_LIMIT_WINDOW: 1m
       API_AUTH_RATE_LIMIT: 120
@@ -62,9 +89,9 @@ services:
     volumes:
       - uploads-data:/app/uploads
     depends_on:
-      - postgres
-      - redis
-      - minio
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
 
   ai:
     build:
@@ -82,9 +109,9 @@ services:
     volumes:
       - uploads-data:/app/uploads
     depends_on:
-      - postgres
-      - redis
-      - minio
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
 
   web:
     build:
@@ -96,7 +123,8 @@ services:
     environment:
       NEXT_API_URL: http://api:8080
       NEXT_AI_URL: http://ai:8000
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
       PORT: 3000
     ports:
@@ -104,6 +132,7 @@ services:
     depends_on:
       - api
       - ai
+    restart: unless-stopped
 
 volumes:
   postgres-data:

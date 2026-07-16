@@ -4,9 +4,22 @@ import time
 import numpy as np
 from typing import List, Optional
 from google.genai import types
-from app.config import GOOGLE_API_KEY, gemini_client, groq_client, logger
+from app.config import GOOGLE_API_KEY, gemini_client, groq_client, logger, GEMINI_MODEL, GEMINI_EMBED_MODEL, GEMINI_EMBED_DIM, GROQ_MODEL
 import app.database as database
 from app.utils.helpers import optional_uuid
+
+class LLMUnavailableError(RuntimeError):
+    """Raised when every configured LLM provider fails or none is configured.
+    Callers must treat this as an error path — never parse it as model output."""
+
+def _l2_normalize(values: List[float]) -> List[float]:
+    """gemini-embedding-001 only pre-normalizes at 3072 dims; normalize truncated
+    outputs so cosine distance behaves correctly."""
+    norm = float(np.linalg.norm(values)) or 1.0
+    return [v / norm for v in values]
+
+def _embed_config(task_type: str):
+    return types.EmbedContentConfig(task_type=task_type, output_dimensionality=GEMINI_EMBED_DIM)
 
 async def log_model_call(
     service_name: str,
@@ -49,111 +62,106 @@ def deterministic_embedding_1536(text: str) -> List[float]:
     norm = float(np.linalg.norm(values)) or 1.0
     return [v / norm for v in values]
 
-async def get_gemini_embedding_1536(text: str, org_id: Optional[str] = None, correlation_id: Optional[str] = None) -> List[float]:
+async def get_gemini_embedding_1536(text: str, org_id: Optional[str] = None, correlation_id: Optional[str] = None,
+                                     task_type: str = "RETRIEVAL_QUERY") -> Optional[List[float]]:
     """
-    Generates 1536-dimensional embeddings using Gemini text-embedding-004.
-    Since text-embedding-004 produces 768 dimensions by default, we concatenate the vector
-    with itself to yield exactly 1536 dimensions. This preserves cosine similarity mathematically.
+    Generates a query-side embedding at GEMINI_EMBED_DIM (1536) via gemini-embedding-001.
+
+    Returns None when no real embedding can be produced — callers must skip vector
+    search rather than compare a fake vector against real document embeddings.
     """
     if not GOOGLE_API_KEY or not gemini_client:
-        return deterministic_embedding_1536(text)
+        return None
 
     try:
         start_time = time.time()
         response = await gemini_client.aio.models.embed_content(
-            model="text-embedding-004",
+            model=GEMINI_EMBED_MODEL,
             contents=text,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT"
-            )
+            config=_embed_config(task_type)
         )
         latency = int((time.time() - start_time) * 1000)
-        
+
         # Log embedding call
         asyncio.create_task(log_model_call(
             service_name="copilot",
             provider="google",
-            model="text-embedding-004",
+            model=GEMINI_EMBED_MODEL,
             status="SUCCESS",
             latency_ms=latency,
             org_id=org_id,
             correlation_id=correlation_id
         ))
 
-        emb_768 = response.embeddings[0].values
-        emb_1536 = emb_768 + emb_768
-        return emb_1536
+        return _l2_normalize(response.embeddings[0].values)
     except Exception as e:
         logger.error(f"Error generating Gemini embedding: {e}")
         asyncio.create_task(log_model_call(
             service_name="copilot",
             provider="google",
-            model="text-embedding-004",
+            model=GEMINI_EMBED_MODEL,
             status="FAILED",
             latency_ms=0,
             org_id=org_id,
             correlation_id=correlation_id
         ))
-        return deterministic_embedding_1536(text)
+        return None
 
-async def get_gemini_embeddings_1536_batch(texts: List[str], org_id: Optional[str] = None, correlation_id: Optional[str] = None) -> List[List[float]]:
+async def get_gemini_embeddings_1536_batch(texts: List[str], org_id: Optional[str] = None, correlation_id: Optional[str] = None) -> tuple:
     """
-    Generates 1536-dimensional embeddings for a list of texts in a single batch call to reduce roundtrips.
+    Generates 1536-dimensional embeddings for a list of texts in a single batch call.
+
+    Returns (embeddings, used_fallback). used_fallback=True means the vectors are
+    deterministic hash pseudo-embeddings (semantic search will not work for them);
+    ingestion must surface this as PARTIAL_SUCCESS instead of silently completing.
     """
     if not texts:
-        return []
+        return [], False
 
     if not GOOGLE_API_KEY or not gemini_client:
-        return [deterministic_embedding_1536(t) for t in texts]
+        return [deterministic_embedding_1536(t) for t in texts], True
 
     try:
         start_time = time.time()
         response = await gemini_client.aio.models.embed_content(
-            model="text-embedding-004",
+            model=GEMINI_EMBED_MODEL,
             contents=texts,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT"
-            )
+            config=_embed_config("RETRIEVAL_DOCUMENT")
         )
         latency = int((time.time() - start_time) * 1000)
-        
+
         # Log batch embedding call
         asyncio.create_task(log_model_call(
             service_name="ingestion",
             provider="google",
-            model="text-embedding-004",
+            model=GEMINI_EMBED_MODEL,
             status="SUCCESS",
             latency_ms=latency,
             org_id=org_id,
             correlation_id=correlation_id
         ))
 
-        results = []
-        for emb in response.embeddings:
-            emb_768 = emb.values
-            emb_1536 = emb_768 + emb_768
-            results.append(emb_1536)
-        return results
+        return [_l2_normalize(emb.values) for emb in response.embeddings], False
     except Exception as e:
         logger.error(f"Error generating Gemini batch embeddings: {e}")
         asyncio.create_task(log_model_call(
             service_name="ingestion",
             provider="google",
-            model="text-embedding-004",
+            model=GEMINI_EMBED_MODEL,
             status="FAILED",
             latency_ms=0,
             org_id=org_id,
             correlation_id=correlation_id
         ))
-        return [deterministic_embedding_1536(t) for t in texts]
+        return [deterministic_embedding_1536(t) for t in texts], True
 
 async def generate_text_llm(prompt: str, org_id: Optional[str] = None, correlation_id: Optional[str] = None) -> str:
-    """Helper to generate text using Gemini-1.5-pro or Groq Llama3 with token usage logging"""
+    """Generate text via the configured Gemini model, falling back to Groq. Raises LLMUnavailableError when no provider succeeds."""
     if GOOGLE_API_KEY and gemini_client:
         try:
             start_time = time.time()
             response = await gemini_client.aio.models.generate_content(
-                model='gemini-1.5-pro',
+                model=GEMINI_MODEL,
                 contents=prompt
             )
             latency = int((time.time() - start_time) * 1000)
@@ -167,7 +175,7 @@ async def generate_text_llm(prompt: str, org_id: Optional[str] = None, correlati
             asyncio.create_task(log_model_call(
                 service_name="copilot",
                 provider="google",
-                model="gemini-1.5-pro",
+                model=GEMINI_MODEL,
                 status="SUCCESS",
                 latency_ms=latency,
                 prompt_tokens=prompt_tokens,
@@ -181,7 +189,7 @@ async def generate_text_llm(prompt: str, org_id: Optional[str] = None, correlati
             asyncio.create_task(log_model_call(
                 service_name="copilot",
                 provider="google",
-                model="gemini-1.5-pro",
+                model=GEMINI_MODEL,
                 status="FAILED",
                 latency_ms=0,
                 org_id=org_id,
@@ -196,7 +204,7 @@ async def generate_text_llm(prompt: str, org_id: Optional[str] = None, correlati
                 None,
                 lambda: groq_client.chat.completions.create(
                     messages=[{"role": "user", "content": prompt}],
-                    model="llama3-70b-8192",
+                    model=GROQ_MODEL,
                     temperature=0.2
                 )
             )
@@ -210,7 +218,7 @@ async def generate_text_llm(prompt: str, org_id: Optional[str] = None, correlati
             asyncio.create_task(log_model_call(
                 service_name="copilot",
                 provider="groq",
-                model="llama3-70b-8192",
+                model=GROQ_MODEL,
                 status="SUCCESS",
                 latency_ms=latency,
                 prompt_tokens=prompt_tokens,
@@ -224,11 +232,11 @@ async def generate_text_llm(prompt: str, org_id: Optional[str] = None, correlati
             asyncio.create_task(log_model_call(
                 service_name="copilot",
                 provider="groq",
-                model="llama3-70b-8192",
+                model=GROQ_MODEL,
                 status="FAILED",
                 latency_ms=0,
                 org_id=org_id,
                 correlation_id=correlation_id
             ))
 
-    return "AI generation unavailable. Please check API keys configuration."
+    raise LLMUnavailableError("All LLM providers failed or none is configured (set GOOGLE_API_KEY / GROQ_API_KEY).")

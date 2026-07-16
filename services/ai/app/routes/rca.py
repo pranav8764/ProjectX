@@ -2,12 +2,19 @@ import re
 import uuid
 import json
 from typing import Dict, Any
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.schemas import RCAGenerateRequest
 import app.database as database
+from app.database import get_document_access_columns, document_access_select
 import app.utils.ai_clients as ai_clients
-from app.utils.helpers import optional_uuid, graceful_rca_response
+from app.utils.helpers import (
+    optional_uuid,
+    graceful_rca_response,
+    normalize_asset_tag,
+    resolve_request_role,
+    document_row_access_allowed,
+)
 
 router = APIRouter()
 
@@ -17,31 +24,49 @@ async def generate_rca(request: RCAGenerateRequest):
     if not database.db_pool:
         return graceful_rca_response(request.assetTag, "Database connection unavailable")
 
-    asset_tag = request.assetTag.upper().strip()
+    asset_tag = normalize_asset_tag(request.assetTag)
     def row_value(row, key, default=None):
         try:
             return row[key]
         except (KeyError, IndexError):
             return default
 
+    plant_uuid = optional_uuid(request.plantId)
+    if not plant_uuid:
+        raise HTTPException(status_code=400, detail="A valid plantId is required to generate an RCA")
+
     try:
-        plant_uuid = optional_uuid(request.plantId)
         org_uuid = optional_uuid(request.organizationId)
         async with database.db_pool.acquire() as conn:
-            # Query all entities matching this asset tag to pull corresponding document contents
-            rows = await conn.fetch("""
-                SELECT DISTINCT c.chunk_text, d.title, d.created_at, d.id as document_id
+            if not org_uuid:
+                org_row = await conn.fetchrow("SELECT organization_id FROM identity.plants WHERE id = $1", plant_uuid)
+                org_uuid = org_row["organization_id"] if org_row else None
+            if not org_uuid:
+                raise HTTPException(status_code=404, detail="Plant not found; cannot scope RCA evidence")
+
+            user_role = await resolve_request_role(conn, request, plant_uuid, org_uuid)
+            access_columns = await get_document_access_columns(conn)
+            access_select = document_access_select(access_columns)
+
+            # Query all entities matching this asset tag to pull corresponding document contents.
+            # Tenancy is enforced unconditionally — never fall back to cross-org matching.
+            rows = await conn.fetch(f"""
+                SELECT DISTINCT c.chunk_text, c.page_no, d.title, d.created_at, d.id as document_id,
+                       {access_select}
                 FROM graph.entities e
                 JOIN ingestion.document_chunks c ON e.chunk_id = c.id
                 JOIN document.documents d ON c.document_id = d.id
                 WHERE e.normalized_value = $1
                   AND d.status <> 'ARCHIVED'
                   AND c.document_version_id = d.current_version_id
-                  AND ($2::uuid IS NULL OR d.plant_id = $2)
-                  AND ($3::uuid IS NULL OR d.organization_id = $3)
+                  AND d.plant_id = $2
+                  AND d.organization_id = $3
                 ORDER BY d.created_at DESC
                 LIMIT 10
             """, asset_tag, plant_uuid, org_uuid)
+
+            # Apply the same per-document access filtering the copilot flow uses
+            rows = [r for r in rows if document_row_access_allowed(r, user_role)]
 
             if not rows:
                 return {
@@ -107,8 +132,8 @@ CONFIDENCE: <decimal value>
                 SELECT id, organization_id, plant_id
                 FROM asset.assets
                 WHERE asset_tag = $1
-                  AND ($2::uuid IS NULL OR plant_id = $2)
-                  AND ($3::uuid IS NULL OR organization_id = $3)
+                  AND plant_id = $2
+                  AND organization_id = $3
                 LIMIT 1
             """, asset_tag, plant_uuid, org_uuid)
             if asset_row:
@@ -121,7 +146,12 @@ CONFIDENCE: <decimal value>
             citations = []
             for r in rows:
                 document_id = row_value(r, "document_id")
-                citation = {"documentTitle": row_value(r, "title", "Untitled document")}
+                chunk_text = row_value(r, "chunk_text") or ""
+                citation = {
+                    "documentTitle": row_value(r, "title", "Untitled document"),
+                    "page": row_value(r, "page_no"),
+                    "snippet": chunk_text[:200] + ("..." if len(chunk_text) > 200 else ""),
+                }
                 if document_id is not None:
                     citation["documentId"] = str(document_id)
                 citations.append(citation)
@@ -134,5 +164,7 @@ CONFIDENCE: <decimal value>
                 "citations": citations
             }
 
+    except HTTPException:
+        raise
     except Exception as e:
         return graceful_rca_response(request.assetTag, str(e))

@@ -3,7 +3,7 @@
 import React, { Suspense, useState, useEffect } from 'react';
 import NavigationShell from '../../components/NavigationShell';
 import { useData } from '../../context/DataContext';
-import { generateRca, RcaReport } from '../../lib/mockData';
+import { RcaReport } from '../../lib/mockData';
 import { apiFetch, getStoredSession, PlantBrainSession, readApiError } from '../../lib/api';
 import { canRunAction, getDeniedMessage } from '../../lib/permissions';
 import { useSearchParams } from 'next/navigation';
@@ -112,12 +112,11 @@ function RcaAssistantPageContent() {
       setReport(normalizeRcaReport(data, assetTag, description));
 
     } catch (err) {
-      // Fallback
-      setTimeout(() => {
-        const localReport = generateRca(assetTag, description);
-        setReport(localReport);
-        setLoading(false);
-      }, 1500);
+      // No fabricated RCA: showing a canned root-cause analysis with fake confidence
+      // would be an unsupported claim. Surface the failure instead.
+      const message = err instanceof Error ? err.message : 'The RCA service is unavailable.';
+      setActionError(`Unable to generate an RCA right now. ${message} Please retry once the AI service is available.`);
+      setLoading(false);
       return;
     }
     setLoading(false);

@@ -4,6 +4,26 @@
 
 BEGIN;
 
+-- Deterministic, normalized 1536-dim pseudo-embedding for seed chunks.
+-- The previous seeds used all-zero vectors, whose cosine distance is NaN in pgvector,
+-- which broke vector retrieval entirely. These vectors are not semantically meaningful
+-- (real ingestion produces Gemini embeddings) but are valid unit vectors, so seeded
+-- chunks are reachable by the keyword/tag path and never poison an ORDER BY distance.
+CREATE OR REPLACE FUNCTION pg_temp.seed_embedding(seed_text text)
+RETURNS vector AS $seed$
+DECLARE
+  vals double precision[];
+  norm double precision;
+BEGIN
+  PERFORM setseed((hashtext(seed_text) % 2000000)::double precision / 2000000);
+  SELECT array_agg(random() - 0.5) INTO vals FROM generate_series(1, 1536);
+  SELECT sqrt(sum(v * v)) INTO norm FROM unnest(vals) v;
+  IF norm IS NULL OR norm = 0 THEN norm := 1; END IF;
+  SELECT array_agg(v / norm) INTO vals FROM unnest(vals) v;
+  RETURN vals::vector;
+END;
+$seed$ LANGUAGE plpgsql;
+
 -- Truncate existing data to start with a clean slate
 TRUNCATE TABLE
   identity.memberships,
@@ -247,43 +267,43 @@ BEGIN
 
   -- 10. Insert Document Versions
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_manual_id, 'v1.0', 's3://plantbrain-vault/pump_p-101_oem_manual.pdf', 'application/pdf', md5('Pump P-101 OEM Manual'), 0.99, 0.98)
+  VALUES (v_doc_manual_id, 'v1.0', 's3://plantbrain-documents/pump_p-101_oem_manual.pdf', 'application/pdf', encode(sha256(convert_to('Pump P-101 OEM Manual', 'UTF8')), 'hex'), 0.99, 0.98)
   RETURNING id INTO v_doc_manual_ver_id;
 
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_log_id, 'v1.0', 's3://plantbrain-vault/pump_p-101_maintenance_log.pdf', 'application/pdf', md5('Pump P-101 Maintenance Log'), 0.95, 0.92)
+  VALUES (v_doc_log_id, 'v1.0', 's3://plantbrain-documents/pump_p-101_maintenance_log.pdf', 'application/pdf', encode(sha256(convert_to('Pump P-101 Maintenance Log', 'UTF8')), 'hex'), 0.95, 0.92)
   RETURNING id INTO v_doc_log_ver_id;
 
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_wo_id, 'v1.0', 's3://plantbrain-vault/work_order_wo-223.pdf', 'application/pdf', md5('Work Order WO-223'), 0.97, 0.94)
+  VALUES (v_doc_wo_id, 'v1.0', 's3://plantbrain-documents/work_order_wo-223.pdf', 'application/pdf', encode(sha256(convert_to('Work Order WO-223', 'UTF8')), 'hex'), 0.97, 0.94)
   RETURNING id INTO v_doc_wo_ver_id;
 
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_ir_id, 'v1.0', 's3://plantbrain-vault/inspection_report_ir-91.pdf', 'application/pdf', md5('Inspection Report IR-91'), 0.98, 0.96)
+  VALUES (v_doc_ir_id, 'v1.0', 's3://plantbrain-documents/inspection_report_ir-91.pdf', 'application/pdf', encode(sha256(convert_to('Inspection Report IR-91', 'UTF8')), 'hex'), 0.98, 0.96)
   RETURNING id INTO v_doc_ir_ver_id;
 
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_sop_id, 'v1.0', 's3://plantbrain-vault/boiler_sop.pdf', 'application/pdf', md5('Boiler SOP'), 0.99, 0.99)
+  VALUES (v_doc_sop_id, 'v1.0', 's3://plantbrain-documents/boiler_sop.pdf', 'application/pdf', encode(sha256(convert_to('Boiler SOP', 'UTF8')), 'hex'), 0.99, 0.99)
   RETURNING id INTO v_doc_sop_ver_id;
 
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_safety_id, 'v1.0', 's3://plantbrain-vault/safety_checklist.pdf', 'application/pdf', md5('Safety Checklist'), 0.96, 0.95)
+  VALUES (v_doc_safety_id, 'v1.0', 's3://plantbrain-documents/safety_checklist.pdf', 'application/pdf', encode(sha256(convert_to('Safety Checklist', 'UTF8')), 'hex'), 0.96, 0.95)
   RETURNING id INTO v_doc_safety_ver_id;
 
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_audit_id, 'v1.0', 's3://plantbrain-vault/audit_report.pdf', 'application/pdf', md5('Audit Report'), 0.98, 0.97)
+  VALUES (v_doc_audit_id, 'v1.0', 's3://plantbrain-documents/audit_report.pdf', 'application/pdf', encode(sha256(convert_to('Audit Report', 'UTF8')), 'hex'), 0.98, 0.97)
   RETURNING id INTO v_doc_audit_ver_id;
 
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_incident_id, 'v1.0', 's3://plantbrain-vault/incident_report.pdf', 'application/pdf', md5('Incident Report'), 0.94, 0.90)
+  VALUES (v_doc_incident_id, 'v1.0', 's3://plantbrain-documents/incident_report.pdf', 'application/pdf', encode(sha256(convert_to('Incident Report', 'UTF8')), 'hex'), 0.94, 0.90)
   RETURNING id INTO v_doc_incident_ver_id;
 
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_compressor_id, 'v1.0', 's3://plantbrain-vault/compressor_manual.pdf', 'application/pdf', md5('Compressor Manual'), 0.99, 0.98)
+  VALUES (v_doc_compressor_id, 'v1.0', 's3://plantbrain-documents/compressor_manual.pdf', 'application/pdf', encode(sha256(convert_to('Compressor Manual', 'UTF8')), 'hex'), 0.99, 0.98)
   RETURNING id INTO v_doc_compressor_ver_id;
 
   INSERT INTO document.document_versions (document_id, version_label, file_url, file_type, file_sha256, ocr_confidence, classification_confidence)
-  VALUES (v_doc_compliance_id, 'v1.0', 's3://plantbrain-vault/compliance_checklist.pdf', 'application/pdf', md5('Compliance Checklist'), 0.98, 0.96)
+  VALUES (v_doc_compliance_id, 'v1.0', 's3://plantbrain-documents/compliance_checklist.pdf', 'application/pdf', encode(sha256(convert_to('Compliance Checklist', 'UTF8')), 'hex'), 0.98, 0.96)
   RETURNING id INTO v_doc_compliance_ver_id;
 
   -- Update Documents current_version_id
@@ -333,31 +353,31 @@ BEGIN
   INSERT INTO ingestion.document_chunks (document_id, document_version_id, page_no, chunk_index, chunk_text, embedding, token_count, metadata_json)
   VALUES (v_doc_log_id, v_doc_log_ver_id, 1, 0, 
           'Annual maintenance log for Unit-2 Cooling Water Pump P-101. On 12 Jan 2025, technician Ravi reported bearing seal leakage and high vibration velocity. Bearing housing was inspected.',
-          array_fill(0.0::double precision, ARRAY[1536])::vector, 34, '{"asset_tags": ["P-101"]}')
+          pg_temp.seed_embedding('v_chunk_log_id'), 34, '{"asset_tags": ["P-101"]}')
   RETURNING id INTO v_chunk_log_id;
 
   INSERT INTO ingestion.document_chunks (document_id, document_version_id, page_no, chunk_index, chunk_text, embedding, token_count, metadata_json)
   VALUES (v_doc_wo_id, v_doc_wo_ver_id, 1, 0,
           'Work Order WO-223. Asset: P-101. Date: 14 Jan 2025. Description: Replace primary mechanical seal and outer bearings due to heavy leakage. Recommended action: perform quarterly shaft alignment.',
-          array_fill(0.0::double precision, ARRAY[1536])::vector, 34, '{"asset_tags": ["P-101"], "work_order": "WO-223"}')
+          pg_temp.seed_embedding('v_chunk_wo_id'), 34, '{"asset_tags": ["P-101"], "work_order": "WO-223"}')
   RETURNING id INTO v_chunk_wo_id;
 
   INSERT INTO ingestion.document_chunks (document_id, document_version_id, page_no, chunk_index, chunk_text, embedding, token_count, metadata_json)
   VALUES (v_doc_sop_id, v_doc_sop_ver_id, 1, 0,
           'Standard Operating Procedure (SOP) for Industrial Boiler B-12 Startup. Author: Arjun. Ensure water levels are optimal. Slowly open main steam valve. Set burner pressure to 12.5 bar.',
-          array_fill(0.0::double precision, ARRAY[1536])::vector, 32, '{"asset_tags": ["B-12"], "doc_type": "SOP"}')
+          pg_temp.seed_embedding('v_chunk_sop_id'), 32, '{"asset_tags": ["B-12"], "doc_type": "SOP"}')
   RETURNING id INTO v_chunk_sop_id;
 
   INSERT INTO ingestion.document_chunks (document_id, document_version_id, page_no, chunk_index, chunk_text, embedding, token_count, metadata_json)
   VALUES (v_doc_ir_id, v_doc_ir_ver_id, 1, 0,
           'Inspection Report IR-91. Asset Tag: B-12. Inspected on 01 Jun 2025. Results: Found minor scale build-up inside the safety valve. Hydrostatic test was not completed due to scheduling conflict.',
-          array_fill(0.0::double precision, ARRAY[1536])::vector, 34, '{"asset_tags": ["B-12"], "report_id": "IR-91"}')
+          pg_temp.seed_embedding('v_chunk_ir_id'), 34, '{"asset_tags": ["B-12"], "report_id": "IR-91"}')
   RETURNING id INTO v_chunk_ir_id;
 
   INSERT INTO ingestion.document_chunks (document_id, document_version_id, page_no, chunk_index, chunk_text, embedding, token_count, metadata_json)
   VALUES (v_doc_incident_id, v_doc_incident_ver_id, 1, 0,
           'Incident Report. Asset: P-101. Date: 20 Feb 2025. Maintenance Team reported sudden failure of seal on Pump P-101 due to running dry during startup. Cause: missing SOP adherence.',
-          array_fill(0.0::double precision, ARRAY[1536])::vector, 33, '{"asset_tags": ["P-101"]}')
+          pg_temp.seed_embedding('v_chunk_inc_id'), 33, '{"asset_tags": ["P-101"]}')
   RETURNING id INTO v_chunk_inc_id;
 
   -- 13. Insert Graph Entities

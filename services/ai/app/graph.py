@@ -1,6 +1,7 @@
 import re
 import uuid
 import logging
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -19,6 +20,22 @@ from app.utils.helpers import (
 )
 
 logger = logging.getLogger("plantbrain-ai.graph")
+
+def parse_filter_datetime(value: Any) -> Optional[datetime]:
+    """asyncpg requires datetime objects for timestamptz params; the frontend sends
+    ISO strings ('2025-03-01' / '2025-03-01T00:00:00Z'), which would otherwise raise."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning(f"Ignoring unparseable date filter value: {value!r}")
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 # ==========================================
 # GRAPH NODES IMPLEMENTATION
@@ -91,72 +108,86 @@ async def retrieval_node(state: CopilotState) -> Dict[str, Any]:
     if not plant_uuid:
         return {"retrieved_chunks": []}
         
-    # Generate 1536-dimensional query embedding
+    # Generate 1536-dimensional query embedding (None => vector search unavailable)
     query_embedding = await ai_clients.get_gemini_embedding_1536(question)
-    
+
     filters = state.get("filters") or {}
     document_type_filters = normalize_filter_values(filters.get("documentTypes") or filters.get("documentType"))
-    date_from = filters.get("dateFrom")
-    date_to = filters.get("dateTo")
-    
+    date_from = parse_filter_datetime(filters.get("dateFrom"))
+    date_to = parse_filter_datetime(filters.get("dateTo"))
+
+    missing_info = list(state.get("missing_info") or [])
+
     async with database.db_pool.acquire() as conn:
         # Resolve plant org context if not set
         if not org_id:
             org_row = await conn.fetchrow("SELECT organization_id FROM identity.plants WHERE id = $1", plant_uuid)
             org_id = org_row["organization_id"] if org_row else None
-            
+
         access_columns = await get_document_access_columns(conn)
         access_select = document_access_select(access_columns)
-        
-        # 1. Retrieve Candidate Chunks by Cosine Distance
-        chunks_rows = await conn.fetch(f"""
-            SELECT c.id, c.document_id, c.page_no, c.chunk_text, d.title,
-                   {access_select},
-                   (c.embedding <=> $1) as distance
-            FROM ingestion.document_chunks c
-            JOIN document.documents d ON c.document_id = d.id
-            WHERE d.plant_id = $2
-              AND d.organization_id = $3
-              AND d.status <> 'ARCHIVED'
-              AND c.document_version_id = d.current_version_id
-              AND (cardinality($4::text[]) = 0 OR d.document_type = ANY($4::text[]))
-              AND ($5::timestamptz IS NULL OR d.created_at >= $5::timestamptz)
-              AND ($6::timestamptz IS NULL OR d.created_at <= $6::timestamptz)
-            ORDER BY distance ASC
-            LIMIT 6
-        """, query_embedding, plant_uuid, org_id, document_type_filters, date_from, date_to)
-        
+
+        # 1. Retrieve Candidate Chunks by Cosine Distance.
+        # A vector-path failure must never take the keyword path down with it.
+        chunks_rows = []
+        if query_embedding is not None:
+            try:
+                chunks_rows = await conn.fetch(f"""
+                    SELECT c.id, c.document_id, c.page_no, c.chunk_text, d.title,
+                           {access_select},
+                           (c.embedding <=> $1) as distance
+                    FROM ingestion.document_chunks c
+                    JOIN document.documents d ON c.document_id = d.id
+                    WHERE d.plant_id = $2
+                      AND d.organization_id = $3
+                      AND d.status <> 'ARCHIVED'
+                      AND c.document_version_id = d.current_version_id
+                      AND (cardinality($4::text[]) = 0 OR d.document_type = ANY($4::text[]))
+                      AND ($5::timestamptz IS NULL OR d.created_at >= $5::timestamptz)
+                      AND ($6::timestamptz IS NULL OR d.created_at <= $6::timestamptz)
+                    ORDER BY distance ASC
+                    LIMIT 6
+                """, query_embedding, plant_uuid, org_id, document_type_filters, date_from, date_to)
+            except Exception as e:
+                logger.error(f"Vector similarity search failed; continuing with keyword search only: {e}")
+                missing_info.append("Semantic search was unavailable for this query; results rely on keyword matching only.")
+        else:
+            missing_info.append("Semantic search was unavailable for this query (no embedding provider); results rely on keyword matching only.")
+
         # 2. Keyword exact tag search fallback using single optimized unnest query
         keyword_chunks = []
         extracted_tags = re.findall(r"\b[A-Z]+[-\s]*\d+[A-Z]*\b", question.upper())
         asset_filter = filters.get("assetTag")
         if asset_filter:
             extracted_tags.append(asset_filter.upper())
-            
+
         if extracted_tags:
             tag_wildcards = [f"%{tag}%" for tag in extracted_tags]
-            k_rows = await conn.fetch(f"""
-                SELECT c.id, c.document_id, c.page_no, c.chunk_text, d.title,
-                       {access_select},
-                       0.0 as distance
-                FROM ingestion.document_chunks c
-                JOIN document.documents d ON c.document_id = d.id
-                WHERE d.plant_id = $1
-                  AND d.organization_id = $3
-                  AND d.status <> 'ARCHIVED'
-                  AND c.document_version_id = d.current_version_id
-                  AND (cardinality($4::text[]) = 0 OR d.document_type = ANY($4::text[]))
-                  AND ($5::timestamptz IS NULL OR d.created_at >= $5::timestamptz)
-                  AND ($6::timestamptz IS NULL OR d.created_at <= $6::timestamptz)
-                  AND (
-                    EXISTS (
-                      SELECT 1 FROM unnest($2::text[]) AS val WHERE c.chunk_text ILIKE val OR d.title ILIKE val
-                    )
-                  )
-                LIMIT 6
-            """, plant_uuid, tag_wildcards, org_id, document_type_filters, date_from, date_to)
-            keyword_chunks.extend(k_rows)
-            
+            try:
+                k_rows = await conn.fetch(f"""
+                    SELECT c.id, c.document_id, c.page_no, c.chunk_text, d.title,
+                           {access_select},
+                           0.0 as distance
+                    FROM ingestion.document_chunks c
+                    JOIN document.documents d ON c.document_id = d.id
+                    WHERE d.plant_id = $1
+                      AND d.organization_id = $3
+                      AND d.status <> 'ARCHIVED'
+                      AND c.document_version_id = d.current_version_id
+                      AND (cardinality($4::text[]) = 0 OR d.document_type = ANY($4::text[]))
+                      AND ($5::timestamptz IS NULL OR d.created_at >= $5::timestamptz)
+                      AND ($6::timestamptz IS NULL OR d.created_at <= $6::timestamptz)
+                      AND (
+                        EXISTS (
+                          SELECT 1 FROM unnest($2::text[]) AS val WHERE c.chunk_text ILIKE val OR d.title ILIKE val
+                        )
+                      )
+                    LIMIT 6
+                """, plant_uuid, tag_wildcards, org_id, document_type_filters, date_from, date_to)
+                keyword_chunks.extend(k_rows)
+            except Exception as e:
+                logger.error(f"Keyword tag search failed: {e}")
+
         # Combine searches
         seen = set()
         retrieved = []
@@ -164,8 +195,8 @@ async def retrieval_node(state: CopilotState) -> Dict[str, Any]:
             if r["id"] not in seen:
                 seen.add(r["id"])
                 retrieved.append(dict(r))
-                
-    return {"retrieved_chunks": retrieved}
+
+    return {"retrieved_chunks": retrieved, "missing_info": missing_info}
 
 async def rbac_node(state: CopilotState) -> Dict[str, Any]:
     """Filters retrieved chunks using Role-Based Access Control configuration"""
@@ -237,10 +268,13 @@ User latest input: {question}
 AI:
 """
         answer = await ai_clients.generate_text_llm(prompt)
+        # Conversational replies carry no document evidence — never report full
+        # confidence for an uncited answer (AI-safety: no unsupported max-confidence output).
         return {
             "answer": answer,
-            "confidence": 1.0,
+            "confidence": 0.5,
             "citations": [],
+            "missing_info": ["Conversational response — not based on plant documents."],
             "validation_attempts": attempts
         }
         
@@ -365,6 +399,30 @@ def route_after_generation(state: CopilotState) -> str:
 # ==========================================
 # GRAPH COMPILATION ENGINE
 # ==========================================
+
+# Compiled once at startup and reused across requests. Per-request compilation plus
+# AsyncPostgresSaver.setup() (a DDL round-trip) added seconds to every query.
+copilot_graph = None
+
+async def init_copilot_graph():
+    """Builds the checkpointer (running setup() exactly once) and compiles the graph."""
+    global copilot_graph
+    from langgraph.checkpoint.memory import MemorySaver
+    checkpointer = None
+    if database.psycopg_pool:
+        try:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            saver = AsyncPostgresSaver(database.psycopg_pool)
+            await saver.setup()
+            checkpointer = saver
+            logger.info("Copilot graph using PostgreSQL checkpointer")
+        except Exception as pg_err:
+            logger.warning(f"Failed to initialize PostgreSQL checkpointer: {pg_err}. Falling back to MemorySaver.")
+            checkpointer = MemorySaver()
+    else:
+        checkpointer = MemorySaver()
+    copilot_graph = compile_copilot_graph(checkpointer=checkpointer)
+    return copilot_graph
 
 def compile_copilot_graph(checkpointer: Optional[Any] = None) -> StateGraph:
     """Builds and compiles the Copilot workflow graph"""

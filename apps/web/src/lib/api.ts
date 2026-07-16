@@ -82,27 +82,26 @@ export function getPlantId() {
 }
 
 export function getApiToken(): string {
-  if (typeof window === 'undefined') {
-    return DEFAULT_DEV_TOKEN;
-  }
-
-  const directToken = localStorage.getItem(TOKEN_KEY);
-  if (directToken) {
-    return directToken;
-  }
-
-  return getStoredSession()?.token || DEFAULT_DEV_TOKEN;
+  // Auth is cookie-based (BetterAuth). A bearer token is only used if one was
+  // explicitly stored (e.g. a service/dev token) — never a hardcoded default.
+  if (typeof window === 'undefined') return '';
+  return localStorage.getItem(TOKEN_KEY) || getStoredSession()?.token || '';
 }
 
 export function authHeaders(extra?: HeadersInit): HeadersInit {
   const headers = new Headers(extra);
-  headers.set('Authorization', `Bearer ${getApiToken()}`);
+  const token = getApiToken();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
   return headers;
 }
 
 export async function apiFetch(path: string, init: RequestInit = {}) {
   const response = await fetch(path, {
     ...init,
+    // Send the BetterAuth session cookie with same-origin /api requests.
+    credentials: 'include',
     headers: authHeaders(init.headers),
   });
 
