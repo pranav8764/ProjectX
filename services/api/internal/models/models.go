@@ -27,6 +27,7 @@ type Failure struct {
 	Confidence      float64   `json:"confidence"`
 	CreatedBy       *string   `json:"createdBy,omitempty"`
 	CreatedAt       time.Time `json:"createdAt"`
+	Source          string    `json:"source"`
 }
 
 // Gap represents a compliance gap

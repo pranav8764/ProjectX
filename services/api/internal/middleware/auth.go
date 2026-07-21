@@ -32,11 +32,14 @@ func AuthMiddleware(dbPool *pgxpool.Pool) gin.HandlerFunc {
 			}
 		}
 
-		// 2. Try Cookie
+		// 2. Try Cookie. BetterAuth names it "better-auth.session_token" (underscore);
+		// the hyphenated form is kept as a fallback for older/custom clients.
 		if token == "" {
-			cookie, err := c.Cookie("better-auth.session-token")
-			if err == nil {
-				token = cookie
+			for _, name := range []string{"better-auth.session_token", "better-auth.session-token"} {
+				if cookie, err := c.Cookie(name); err == nil && cookie != "" {
+					token = cookie
+					break
+				}
 			}
 		}
 
@@ -81,6 +84,14 @@ func AuthMiddleware(dbPool *pgxpool.Pool) gin.HandlerFunc {
 
 		// Fallback to session token in identity.sessions
 		if userIDStr == "" {
+			// BetterAuth signs the session cookie as "<token>.<hmac-signature>";
+			// the stored session row holds only the token, so use the part before
+			// the first dot. Plain bearer tokens (no dot) pass through unchanged.
+			sessionToken := token
+			if idx := strings.IndexByte(sessionToken, '.'); idx >= 0 {
+				sessionToken = sessionToken[:idx]
+			}
+
 			query := `
 				SELECT
 					s.user_id::text,
@@ -91,11 +102,11 @@ func AuthMiddleware(dbPool *pgxpool.Pool) gin.HandlerFunc {
 				JOIN identity.users u ON s.user_id = u.id
 				LEFT JOIN identity.memberships m ON u.id = m.user_id
 				LEFT JOIN identity.roles r ON m.role_id = r.id
-				WHERE (s.token = $1 OR s.id = $1) AND s.expires_at > NOW()
+				WHERE s.token = $1 AND s.expires_at > NOW()
 				LIMIT 1
 			`
 
-			err := dbPool.QueryRow(ctx, query, token).Scan(&userIDStr, &orgIDStr, &plantIDStr, &roleStr)
+			err := dbPool.QueryRow(ctx, query, sessionToken).Scan(&userIDStr, &orgIDStr, &plantIDStr, &roleStr)
 			if err != nil {
 				log.Printf("Auth check failed: %v", err)
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized: invalid or expired session"})

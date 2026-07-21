@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"plantbrain-api/internal/auth"
 	"plantbrain-api/internal/models"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -68,6 +70,65 @@ func HandleGetComplianceGaps(dbPool *pgxpool.Pool) gin.HandlerFunc {
 		}
 
 		c.JSON(http.StatusOK, gaps)
+	}
+}
+
+// HandleUpdateComplianceGap handles PATCH /api/compliance/gaps/:id
+func HandleUpdateComplianceGap(dbPool *pgxpool.Pool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		gapID := c.Param("id")
+		if _, err := uuid.Parse(gapID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid gap id format"})
+			return
+		}
+		orgID := c.GetString("orgID")
+		ctx := c.Request.Context()
+
+		var body struct {
+			Status string `json:"status" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		status := strings.ToUpper(strings.TrimSpace(body.Status))
+		if status != "OPEN" && status != "CLOSED" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "status must be one of OPEN or CLOSED"})
+			return
+		}
+
+		var plantID *string
+		if err := dbPool.QueryRow(ctx, `
+			SELECT plant_id::text
+			FROM compliance.gaps
+			WHERE id = $1 AND organization_id = $2
+		`, gapID, orgID).Scan(&plantID); err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "compliance gap not found"})
+			return
+		}
+		if !auth.RequirePlantAccess(c, dbPool, stringValue(plantID)) {
+			return
+		}
+
+		tag, err := dbPool.Exec(ctx, `
+			UPDATE compliance.gaps
+			SET status = $1, updated_at = NOW()
+			WHERE id = $2 AND organization_id = $3
+		`, status, gapID, orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update compliance gap: %v", err)})
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "compliance gap not found"})
+			return
+		}
+
+		recordAuditEvent(c, dbPool, stringValue(plantID), "COMPLIANCE_GAP_UPDATED", "compliance_gap", gapID, map[string]interface{}{
+			"status": status,
+		})
+
+		c.JSON(http.StatusOK, gin.H{"id": gapID, "status": status})
 	}
 }
 

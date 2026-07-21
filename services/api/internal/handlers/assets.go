@@ -194,6 +194,7 @@ func HandleGetAssetByID(dbPool *pgxpool.Pool) gin.HandlerFunc {
 					f.Timeline = jsonTextList(timelineJSON)
 					f.ProbableCauses = jsonTextList(causesJSON)
 					f.Recommendations = jsonTextList(recsJSON)
+					f.Source = "RCA"
 					failures = append(failures, f)
 				} else {
 					log.Printf("Failed to scan RCA report: %v", err)

@@ -732,6 +732,29 @@ func HandleDocumentUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucke
 
 		fileURL := fmt.Sprintf("%s/%s/%s", strings.TrimRight(s3Endpoint, "/"), bucketName, objectKey)
 
+		// FR-3 metadata supplied by the uploader. Title falls back to the filename; the
+		// rest is preserved in documents.metadata_json so it is not silently dropped.
+		docTitle := strings.TrimSpace(c.PostForm("title"))
+		if docTitle == "" {
+			docTitle = header.Filename
+		}
+		versionLabel := strings.TrimSpace(c.PostForm("version"))
+		if versionLabel == "" {
+			versionLabel = "v1"
+		}
+		docMetadata := map[string]interface{}{}
+		if dept := strings.TrimSpace(c.PostForm("department")); dept != "" {
+			docMetadata["department"] = dept
+		}
+		if assetTag := strings.TrimSpace(c.PostForm("assetTag")); assetTag != "" {
+			docMetadata["assetTag"] = strings.ToUpper(assetTag)
+		}
+		docMetadataJSON, err := json.Marshal(docMetadata)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to encode document metadata: %v", err)})
+			return
+		}
+
 		ctx := c.Request.Context()
 		tx, err := dbPool.Begin(ctx)
 		if err != nil {
@@ -743,10 +766,10 @@ func HandleDocumentUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucke
 		_, err = tx.Exec(ctx, `
 			INSERT INTO document.documents (
 				id, organization_id, plant_id, title, document_type, access_level, sensitivity, allowed_roles,
-				current_version_id, status, uploaded_by, created_at, updated_at
+				current_version_id, status, uploaded_by, metadata_json, created_at, updated_at
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, 'UPLOADED', $9, NOW(), NOW())
-		`, docID, orgID, plantID, header.Filename, documentType, accessPolicy.AccessLevel, accessPolicy.Sensitivity, accessPolicy.AllowedRoles, userID)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, 'UPLOADED', $9, $10, NOW(), NOW())
+		`, docID, orgID, plantID, docTitle, documentType, accessPolicy.AccessLevel, accessPolicy.Sensitivity, accessPolicy.AllowedRoles, userID, docMetadataJSON)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to insert document metadata: %v", err)})
 			return
@@ -755,7 +778,7 @@ func HandleDocumentUpload(dbPool *pgxpool.Pool, minioClient *minio.Client, bucke
 		_, err = tx.Exec(ctx, `
 			INSERT INTO document.document_versions (id, document_id, version_label, file_url, file_type, file_sha256, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, NOW())
-		`, versionID, docID, "v1", fileURL, strings.TrimPrefix(ext, "."), fileSHA256)
+		`, versionID, docID, versionLabel, fileURL, strings.TrimPrefix(ext, "."), fileSHA256)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to insert document version: %v", err)})
 			return

@@ -63,7 +63,7 @@ func HandleRCAGenerate(dbPool *pgxpool.Pool, aiServiceURL string) gin.HandlerFun
 			"failureDescriptionChars": len(req.FailureDescription),
 		})
 
-		aiResp, err := callAIService(c.Request.Context(), http.MethodPost, aiServiceURL, "/rca", payloadBytes)
+		aiResp, err := callAIServiceOpts(c.Request.Context(), http.MethodPost, aiServiceURL, "/rca", payloadBytes, aiLLMServiceTimeout, aiForwardHeaders(c))
 		if err != nil || aiResp.StatusCode < 200 || aiResp.StatusCode >= 300 {
 			reason := aiFailureReason(err, aiResp)
 			recordAuditEvent(c, dbPool, req.PlantID, "RCA_GENERATION_FALLBACK", "asset", req.AssetTag, map[string]interface{}{

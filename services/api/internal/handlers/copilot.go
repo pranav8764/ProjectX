@@ -54,7 +54,7 @@ func HandleCopilotQuery(dbPool *pgxpool.Pool, aiServiceURL string) gin.HandlerFu
 			"hasFilters":    len(req.Filters) > 0,
 		})
 
-		aiResp, err := callAIService(c.Request.Context(), http.MethodPost, aiServiceURL, "/query", payloadBytes)
+		aiResp, err := callAIServiceOpts(c.Request.Context(), http.MethodPost, aiServiceURL, "/query", payloadBytes, aiLLMServiceTimeout, aiForwardHeaders(c))
 		if err != nil || aiResp.StatusCode < 200 || aiResp.StatusCode >= 300 {
 			reason := aiFailureReason(err, aiResp)
 			recordAuditEvent(c, dbPool, req.PlantID, "COPILOT_QUERY_FALLBACK", "copilot_query", "", map[string]interface{}{

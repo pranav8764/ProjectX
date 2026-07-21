@@ -15,6 +15,7 @@ import (
 )
 
 const aiServiceTimeout = 12 * time.Second
+const aiLLMServiceTimeout = 90 * time.Second
 
 type aiServiceResponse struct {
 	StatusCode int
@@ -105,7 +106,14 @@ func recordAuditEvent(c *gin.Context, dbPool *pgxpool.Pool, plantID, eventType, 
 }
 
 func callAIService(ctx context.Context, method, aiServiceURL, path string, body []byte) (aiServiceResponse, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, aiServiceTimeout)
+	return callAIServiceOpts(ctx, method, aiServiceURL, path, body, aiServiceTimeout, nil)
+}
+
+func callAIServiceOpts(ctx context.Context, method, aiServiceURL, path string, body []byte, timeout time.Duration, headers map[string]string) (aiServiceResponse, error) {
+	if timeout <= 0 {
+		timeout = aiServiceTimeout
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	target := strings.TrimRight(aiServiceURL, "/") + path
@@ -115,6 +123,11 @@ func callAIService(ctx context.Context, method, aiServiceURL, path string, body 
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		if v != "" {
+			req.Header.Set(k, v)
+		}
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -129,6 +142,15 @@ func callAIService(ctx context.Context, method, aiServiceURL, path string, body 
 	}
 
 	return aiServiceResponse{StatusCode: resp.StatusCode, Body: respBody}, nil
+}
+
+// aiForwardHeaders propagates request/user identity so the AI service can correlate
+// model calls (ai.model_calls.correlation_id) and apply per-user rate limiting.
+func aiForwardHeaders(c *gin.Context) map[string]string {
+	return map[string]string{
+		"X-Request-ID": c.GetString("requestID"),
+		"X-User-Id":    c.GetString("userID"),
+	}
 }
 
 func aiFailureReason(err error, response aiServiceResponse) string {
